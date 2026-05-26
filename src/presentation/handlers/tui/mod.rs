@@ -43,9 +43,8 @@ pub mod switch_source;
 // Takes `ctx` by value because `App` owns `AppContext` (run_loop / screens
 // access it via `&mut app.ctx`)。對應 cli.rs 的 dispatch arm 同樣 by-value。
 
-pub async fn handle(novel_id: i64, mut ctx: AppContext) -> Result<()> {
-    let reader = reader::ReaderScreen::new(EntryMode::DirectReader, &mut ctx, novel_id).await?;
-    let app = App::new(Box::new(reader), EntryMode::DirectReader, ctx);
+pub async fn handle(novel_id: i64, ctx: AppContext) -> Result<()> {
+    let app = App::new_with_direct_reader(ctx, novel_id).await?;
     run_loop(app).await
 }
 
@@ -117,6 +116,26 @@ impl App {
     #[allow(dead_code)]
     pub fn new(current: Box<dyn Screen>, entry_mode: EntryMode, ctx: AppContext) -> Self {
         Self { current, entry_mode, ctx }
+    }
+
+    /// Convenience ctor — start with `MenuScreen`, `EntryMode::Menu`.
+    ///
+    /// 由 `presentation::handlers::menu::handle`（`novel-looker` 無子命令入口）
+    /// 呼叫，封裝「Box<MenuScreen> + EntryMode::Menu」這對固定組合。
+    pub fn new_with_menu(ctx: AppContext) -> Self {
+        Self::new(Box::new(menu::MenuScreen::new()), EntryMode::Menu, ctx)
+    }
+
+    /// Convenience ctor — start with `ReaderScreen`, `EntryMode::DirectReader`.
+    ///
+    /// 由 `presentation::handlers::tui::handle`（`novel-looker tui <id>` 入口）
+    /// 呼叫，封裝「pre-load ReaderScreen + EntryMode::DirectReader」流程；
+    /// `ReaderScreen::new` 借 `&mut ctx` 完成 inline await 後再把 ctx move
+    /// 進 `App`。
+    pub async fn new_with_direct_reader(mut ctx: AppContext, novel_id: i64) -> Result<Self> {
+        let reader =
+            reader::ReaderScreen::new(EntryMode::DirectReader, &mut ctx, novel_id).await?;
+        Ok(Self::new(Box::new(reader), EntryMode::DirectReader, ctx))
     }
 }
 
