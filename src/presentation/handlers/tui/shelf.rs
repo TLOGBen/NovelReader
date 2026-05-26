@@ -192,9 +192,17 @@ impl Screen for ShelfScreen {
                 Transition::Stay
             }
             KeyCode::Char('s') => {
-                // SwitchSourceScreen 尚未實作（tui-05 才建）。
-                // 暫時以 toast stub，後續 task wire 成 Transition::To。
-                self.toast = Some("（換源等 tui-05 實裝）".into());
+                // 取當前 highlight 的 novel，transition 到 SwitchSourceScreen。
+                // 沒選 / 缺 id → Stay（與 Enter 同樣的防呆 pattern）。
+                if let Some(i) = self.list_state.selected() {
+                    if let Some(novel) = self.novels.get(i) {
+                        if let Some(novel_id) = novel.id {
+                            return Transition::To(Box::new(
+                                crate::presentation::handlers::tui::switch_source::SwitchSourceScreen::new(novel_id),
+                            ));
+                        }
+                    }
+                }
                 Transition::Stay
             }
             KeyCode::Esc | KeyCode::Char('q') => Transition::To(Box::new(
