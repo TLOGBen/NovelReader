@@ -214,6 +214,18 @@ When adding a new subcommand, add the variant to `presentation/cli.rs::Cmd`,
 create `presentation/handlers/<name>.rs`, route it in `cli::run`, and
 keep all formatting/printing in the handler.
 
+### TUI screen 在 layer rule 的歸屬
+
+`presentation/handlers/tui/{menu, shelf, search, reader, switch_source}.rs` 每個
+screen 等同一個 handler — 屬於 presentation 層的 cross-context use case 組合點。
+Screen 可同時 import `catalog::facade` + `library::facade`（與 CLI handler 同層、同
+權限）。layer invariant 不變：`grep -nE "use crate::(catalog|library)::facade"
+src/catalog src/library` 仍應零命中 — catalog/library 內部不互呼 facade。
+
+入口分流：`Cli.cmd: Option<Cmd>`；無參數 → `handlers::menu::handle` 進 TUI 主菜單
+（`App::new_with_menu`）；`tui <id>` 走 `App::new_with_direct_reader`；其他既有
+子命令維持。
+
 ### TUI (`src/presentation/reader.rs`)
 
 Two-pane layout. The fetch is awaited **inline** inside the event loop
