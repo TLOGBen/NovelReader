@@ -1,13 +1,20 @@
-//! Source-switch core logic — pure functions split out of the (forthcoming)
-//! `switch_source` handler so they can be unit-tested without network / SQL.
+//! Source-switch core logic — pure functions + the shared `run()` use case
+//! invoked by both the TUI `SwitchSourceScreen` and the CLI `switch-source`
+//! subcommand (REQ-005 / REQ-007 / REQ-001).
 //!
 //! `evaluate_toc` covers REQ-005 failure classes (d) "0 章" and (e) "全 fallback
 //! name"; the remaining classes (a/b/c — fetch_info / fetch_toc HTTP / timeout)
-//! are surfaced via the same `AbortReason` enum but are decided in `run()`
-//! (TASK-hc-02), not here.
+//! are surfaced via the same `AbortReason` enum but are decided in `run()`.
 
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+
+use crate::catalog;
 use crate::catalog::service::scraper::fallback_chapter_name;
+use crate::library;
 use crate::library::ChapterMeta;
+use crate::presentation::AppContext;
 
 /// Why a source-switch attempt aborted. Each variant maps 1:1 to a REQ-005
 /// failure class; downstream UI formats a user-facing message per variant.
@@ -37,7 +44,7 @@ pub enum AbortReason {
 /// [`fallback_chapter_name`] from `catalog::service::scraper`, the same fn
 /// `Scraper::fetch_toc` calls when populating the placeholder. Any future
 /// reformat of "Chapter N" automatically keeps producer and detector aligned.
-pub fn evaluate_toc(toc: &[ChapterMeta]) -> Result<(), AbortReason> {
+pub fn evaluate_toc(toc: &[ChapterMeta]) -> std::result::Result<(), AbortReason> {
     if toc.is_empty() {
         return Err(AbortReason::EmptyToc);
     }
@@ -45,6 +52,82 @@ pub fn evaluate_toc(toc: &[ChapterMeta]) -> Result<(), AbortReason> {
         return Err(AbortReason::AllFallbackNames);
     }
     Ok(())
+}
+
+/// Outcome of a successful source-switch — surfaces what the caller needs to
+/// rebuild its UI (`new_progress_idx`, `chapter_count`, `new_first_chapter_name`).
+#[derive(Debug)]
+pub struct SwitchOutcome {
+    pub new_progress_idx: i64,
+    pub chapter_count: usize,
+    pub new_first_chapter_name: String,
+}
+
+/// Cross-context use case shared by TUI `SwitchSourceScreen` and CLI
+/// `switch-source` handler. Composes `catalog::facade::get_source` →
+/// `fetch_novel_info` → `fetch_toc_with_timeout(8s)` → `evaluate_toc` →
+/// `library::facade::switch_source_tx`. Any of the five REQ-005 failure
+/// classes aborts *before* the library tx, so the shelf state is unchanged.
+pub async fn run(
+    ctx: &mut AppContext,
+    novel_id: i64,
+    new_src_url: &str,
+    new_book_url: &str,
+) -> Result<SwitchOutcome> {
+    // step 1: lookup new source — None → abort, no DB tx happens.
+    let src = catalog::facade::get_source(&ctx.db, new_src_url)?
+        .ok_or_else(|| anyhow!("找不到書源 {}", new_src_url))?;
+
+    // step 2 (a): fetch_novel_info — propagate as zh-TW abort message.
+    let novel_info = catalog::facade::fetch_novel_info(&ctx.scraper, &src, new_book_url)
+        .await
+        .with_context(|| "換源失敗：取得詳情頁失敗 (a)".to_string())?;
+
+    // toc_url 取自詳情頁，fallback 用 book_url 自己（與既有 sync handler 同步推導）。
+    let toc_url = novel_info
+        .toc_url
+        .clone()
+        .unwrap_or_else(|| new_book_url.to_string());
+
+    // step 3 (b/c): fetch_toc_with_timeout — Err 與 Elapsed 都 propagate。
+    let toc = catalog::facade::fetch_toc_with_timeout(
+        &ctx.scraper,
+        &src,
+        &toc_url,
+        Duration::from_secs(8),
+    )
+    .await
+    .with_context(|| "換源失敗：目錄頁讀取失敗或逾時 (b/c)".to_string())?;
+
+    // step 4 (d/e): evaluate_toc — pure judgement, zh-TW message per variant。
+    evaluate_toc(&toc).map_err(|reason| match reason {
+        AbortReason::EmptyToc => anyhow!("換源失敗：新源目錄為空，可能規則錯誤 (d)"),
+        AbortReason::AllFallbackNames => {
+            anyhow!("換源失敗：新源章節名解析全部失敗，疑為書源規則 bug (e)")
+        }
+        _ => anyhow!("換源失敗：未預期錯誤"),
+    })?;
+
+    let first = toc.first().expect("non-empty checked above");
+    let first_idx = first.index;
+    let first_name = first.name.clone();
+    let chapter_count = toc.len();
+
+    // step 5: library tx — five-class checks all passed, safe to mutate state。
+    library::facade::switch_source_tx(
+        &mut ctx.db,
+        novel_id,
+        new_src_url,
+        new_book_url,
+        &toc,
+    )
+    .with_context(|| "換源失敗：寫入 DB tx 失敗".to_string())?;
+
+    Ok(SwitchOutcome {
+        new_progress_idx: first_idx,
+        chapter_count,
+        new_first_chapter_name: first_name,
+    })
 }
 
 #[cfg(test)]
