@@ -15,3 +15,4 @@ pub mod config;
 pub mod export;
 pub mod import;
 pub mod backup;
+pub mod switch_source_core;

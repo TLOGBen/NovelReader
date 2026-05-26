@@ -114,7 +114,7 @@ impl Scraper {
         let mut chapters = Vec::new();
         for (i, n) in nodes.into_iter().enumerate() {
             let name = rule::extract_within(n, name_rule)?
-                .unwrap_or_else(|| format!("Chapter {}", i + 1));
+                .unwrap_or_else(|| fallback_chapter_name(i as i64));
             let Some(href) = rule::extract_within(n, url_rule)? else { continue };
             let abs = crate::utils::url::resolve(&final_url, &href)?;
             chapters.push(ChapterMeta { index: i as i64, name, url: abs });
@@ -144,6 +144,15 @@ impl Scraper {
         }
         Ok(text)
     }
+}
+
+/// Canonical fallback chapter name used when `ruleToc.chapterName` extraction
+/// yields no value. Single source of truth — `fetch_toc` (above) and
+/// `evaluate_toc` (in `presentation::handlers::switch_source_core`) both call
+/// this, so the "全 fallback name" detection stays drift-resistant: changing
+/// the format here automatically keeps both sides in sync.
+pub(crate) fn fallback_chapter_name(idx: i64) -> String {
+    format!("Chapter {}", idx + 1)
 }
 
 fn pick(node: &scraper::ElementRef<'_>, rule_str: Option<&str>) -> Result<Option<String>> {
