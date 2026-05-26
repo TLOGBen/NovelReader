@@ -16,3 +16,5 @@ pub mod export;
 pub mod import;
 pub mod backup;
 pub mod switch_source_core;
+pub mod switch_source;
+pub mod menu;
