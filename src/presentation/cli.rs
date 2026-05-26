@@ -115,7 +115,8 @@ pub async fn run(cli: Cli, mut ctx: AppContext) -> Result<()> {
         Some(Cmd::Read { novel_id, chapter_index }) => {
             handlers::read::handle(novel_id, chapter_index, &mut ctx).await
         }
-        Some(Cmd::Tui { novel_id }) => handlers::tui::handle(novel_id, &mut ctx).await,
+        // TUI direct entry：tui handler 需要 owned AppContext（App 持有 ctx）。
+        Some(Cmd::Tui { novel_id }) => handlers::tui::handle(novel_id, ctx).await,
         Some(Cmd::Config { action }) => handlers::config::handle(action, &mut ctx).await,
         Some(Cmd::Export { path }) => handlers::export::handle(path, &mut ctx).await,
         Some(Cmd::Import { path }) => handlers::import::handle(path, &mut ctx).await,

@@ -44,6 +44,7 @@ impl Default for MenuScreen {
     }
 }
 
+#[async_trait::async_trait(?Send)]
 impl Screen for MenuScreen {
     fn draw(&mut self, frame: &mut Frame, _ctx: &AppContext) {
         let area = frame.area();
@@ -83,7 +84,7 @@ impl Screen for MenuScreen {
         frame.render_widget(Paragraph::new(status_text), chunks[2]);
     }
 
-    fn handle_event(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> Transition {
+    async fn handle_event(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> Transition {
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.selected = (self.selected + 1) % ITEMS.len();
@@ -154,77 +155,77 @@ mod tests {
         assert!(m.settings_stub_msg.is_none());
     }
 
-    #[test]
-    fn j_moves_down_and_wraps() {
+    #[tokio::test]
+    async fn j_moves_down_and_wraps() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
         for expected in [1usize, 2, 3, 0] {
-            let _ = m.handle_event(press(KeyCode::Char('j')), &mut ctx);
+            let _ = m.handle_event(press(KeyCode::Char('j')), &mut ctx).await;
             assert_eq!(m.selected, expected);
         }
     }
 
-    #[test]
-    fn k_from_zero_wraps_to_last() {
+    #[tokio::test]
+    async fn k_from_zero_wraps_to_last() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
-        let _ = m.handle_event(press(KeyCode::Char('k')), &mut ctx);
+        let _ = m.handle_event(press(KeyCode::Char('k')), &mut ctx).await;
         assert_eq!(m.selected, 3);
     }
 
-    #[test]
-    fn enter_on_quit_item_returns_quit() {
+    #[tokio::test]
+    async fn enter_on_quit_item_returns_quit() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
         m.selected = 3;
-        let t = m.handle_event(press(KeyCode::Enter), &mut ctx);
+        let t = m.handle_event(press(KeyCode::Enter), &mut ctx).await;
         assert!(matches!(t, Transition::Quit));
     }
 
-    #[test]
-    fn q_returns_quit() {
+    #[tokio::test]
+    async fn q_returns_quit() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
-        let t = m.handle_event(press(KeyCode::Char('q')), &mut ctx);
+        let t = m.handle_event(press(KeyCode::Char('q')), &mut ctx).await;
         assert!(matches!(t, Transition::Quit));
     }
 
-    #[test]
-    fn enter_on_settings_sets_stub_msg_and_stays() {
+    #[tokio::test]
+    async fn enter_on_settings_sets_stub_msg_and_stays() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
         m.selected = 2;
-        let t = m.handle_event(press(KeyCode::Enter), &mut ctx);
+        let t = m.handle_event(press(KeyCode::Enter), &mut ctx).await;
         assert!(matches!(t, Transition::Stay));
         assert_eq!(m.settings_stub_msg, Some("尚未實作"));
     }
 
-    #[test]
-    fn enter_on_shelf_shows_placeholder() {
+    #[tokio::test]
+    async fn enter_on_shelf_shows_placeholder() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
         m.selected = 0;
-        let t = m.handle_event(press(KeyCode::Enter), &mut ctx);
+        let t = m.handle_event(press(KeyCode::Enter), &mut ctx).await;
         assert!(matches!(t, Transition::Stay));
         assert!(m.settings_stub_msg.is_some());
     }
 
-    #[test]
-    fn m_key_is_stay_no_panic() {
+    #[tokio::test]
+    async fn m_key_is_stay_no_panic() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
-        let t = m.handle_event(press(KeyCode::Char('m')), &mut ctx);
+        let t = m.handle_event(press(KeyCode::Char('m')), &mut ctx).await;
         assert!(matches!(t, Transition::Stay));
     }
 
-    #[test]
-    fn moving_clears_stub_msg() {
+    #[tokio::test]
+    async fn moving_clears_stub_msg() {
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
         m.selected = 2;
-        let _ = m.handle_event(press(KeyCode::Enter), &mut ctx);
+        let _ = m.handle_event(press(KeyCode::Enter), &mut ctx).await;
         assert!(m.settings_stub_msg.is_some());
-        let _ = m.handle_event(press(KeyCode::Char('j')), &mut ctx);
+        let _ = m.handle_event(press(KeyCode::Char('j')), &mut ctx).await;
         assert!(m.settings_stub_msg.is_none());
     }
 }
