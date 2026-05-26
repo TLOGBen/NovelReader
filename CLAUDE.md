@@ -18,7 +18,7 @@ scaffolded with `parse-novel-site` and `add-to-shelf` skills).
 LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --bin novel-looker
 LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --release
 cargo test                            # all tests (no LIBCLANG needed once built)
-cargo test --package novel-looker rule::tests::parse_attr_and_replace   # one test
+cargo test catalog::service::rule::tests::parse_attr_and_replace        # one test
 cargo run -- <subcommand>             # run CLI without installing
 ```
 
@@ -52,40 +52,65 @@ backup                            # run export → push via configured backend
 Local SQLite DB lives at `$XDG_DATA_HOME/novel-looker/novel-looker.db`
 (via the `dirs` crate). **Not** in the repo.
 
-## Architecture
+## Architecture — DDD 4 context × 5 layer
 
-Data flows in one direction:
+Refactored at commit `e7c936a` into four bounded contexts. Each owns its
+mod tree under `src/<context>/` and exposes a **facade** as its entry
+contract. No flat top-level files for these domains any more.
 
 ```
-book-sources/*.json
-    ↓ source::BookSource (serde)
-    ↓
-Storage (SQLite)  ←→  Scraper (wreq + scraper)
-    ↓                         ↑
-CLI (clap)  ──────────────────┘
-    ↓
-reader.rs (ratatui)         backup.rs ← config.rs
+src/
+├── main.rs                 — clap entry; bootstraps AppContext
+├── config.rs               — ~/.config/novel-looker/config.toml loader
+├── utils/                  — cross-context helpers (URL resolve, …)
+│
+├── catalog/                — “how to extract” + extraction engine
+│   ├── mod.rs              — PL: BookSource, SearchHit
+│   ├── facade.rs           — save_source / list_sources / fetch_novel_info / sync_toc / fetch_chapter_content
+│   ├── dao.rs              — Shared-Kernel writes (sources table, chapters.{idx,name,url})
+│   └── service/            — source.rs · rule.rs · scraper.rs (pure domain, no SQL)
+│
+├── library/                — shelf · TOC · content cache · progress
+│   ├── mod.rs              — PL: Novel, ChapterMeta, Chapter, ReadProgress
+│   ├── facade.rs           — add_novel / list_shelf / get_chapter / save_chapter_content / save_progress …
+│   ├── dao.rs              — owns the SQLite Connection (sole rusqlite entry point for Library)
+│   └── service/shelf.rs    — invariants placeholder
+│
+├── backup/                 — Conformist of Library (4-layer, no dao)
+│   ├── mod.rs
+│   ├── facade.rs           — run_backup (export → push), BackupReceipt
+│   └── service/            — snapshot.rs (export_to / import_from) · transport.rs (push_local / push_webdav)
+│
+└── presentation/           — CLI + TUI
+    ├── mod.rs              — AppContext { db, scraper, config }
+    ├── cli.rs              — Cli / Cmd enums + dispatch to handlers
+    ├── handlers/*.rs       — one file per subcommand; composes catalog + library facades
+    └── reader.rs           — ratatui two-pane TUI
 ```
 
-### Layering rules
+### Layering rules — five layers, vertical per context
 
-Keep code in three layers + a utils pool. New code MUST honor this; when
-modifying existing files, gradually move logic toward the right layer rather
-than tearing down working modules in one shot.
-
-| Layer | Where | Responsibility |
+| Layer | Where | Rule |
 |---|---|---|
-| **action** | `cli.rs` (`Cmd` variants, `run()` match arms) | Parse CLI args, format human output, delegate to facade. **No business logic.** |
-| **facade** | Top-level functions in each domain module (e.g. `backup::run_backup`, `backup::export_to`) | Orchestrate a use case end-to-end across multiple services. One call per intent. |
-| **service** | Module-internal impls (e.g. `Storage::*`, `Scraper::*`, `backup::push_local/push_webdav`, `source::rule::*`) | Single-responsibility primitives. Don't reach across domains. |
-| **utils** | (planned: `utils/mod.rs`) | Pure helpers reused across domains (URL resolve, paragraph normalize, filename sanitize). |
+| **mod.rs (PL)** | `<ctx>/mod.rs` | Only Published-Language types + sub-mod declarations. No logic. |
+| **facade** | `<ctx>/facade.rs` | One fn per use case; called by presentation handlers. **Facades do not call other contexts’ facades** (sole exception: backup→library Conformist). |
+| **service** | `<ctx>/service/*.rs` | Pure domain logic. **MUST NOT import rusqlite or any `dao` module.** |
+| **dao** | `<ctx>/dao.rs` | The **only** rusqlite entry point for that context. Borrow contract: `&LibraryDb` for SELECT, `&mut LibraryDb` for INSERT/UPDATE/transaction. |
+| **handlers (presentation)** | `presentation/handlers/<cmd>.rs` | Where cross-context use cases compose (e.g. `add` = `catalog::fetch_novel_info` + `library::add_novel`). Format CLI output here; no business logic. |
 
-Right now utility helpers like `resolve` / `normalize_paragraphs` (in `scraper.rs`)
-and `backup_filename` (in `backup.rs`) still live next to their first caller.
-Move them to a shared `utils` module on next refactor pass once a second caller
-appears.
+Backup is intentionally **4-layer** — it has no `dao.rs` and reaches data
+exclusively through `library::facade` (`LibraryDbHandle` is re-exported
+from `library::facade` so `backup` never imports `library::dao`).
 
-### The rule DSL (`src/source/rule.rs`) — central design
+### Shared Kernel between Catalog and Library
+
+The `sources` table and the `chapters` table’s `idx / name / url` columns
+are written by **Catalog DAO**. `chapters.content` is written by
+**Library DAO**. Both DAOs share the single `LibraryDb` Connection
+(catalog DAO methods take `&LibraryDb` / `&mut LibraryDb`). Modifying
+the schema on either side requires checking the other side’s DAO.
+
+### The rule DSL (`src/catalog/service/rule.rs`) — central design
 
 Every selector in a `BookSource` is a string in this grammar:
 
@@ -100,14 +125,16 @@ Every selector in a `BookSource` is a string in this grammar:
 
 The rule engine exposes four entry points consumed by `scraper.rs`:
 - `select_nodes(doc, rule)` — element list from a document (for `bookList`, `chapterList`)
-- `select_within(elem, rule)` — element list within an element
+- `select_within(elem, rule)` — element list within an element  *(currently unused — kept for skills/future readers; dead-code warning expected)*
 - `extract_doc(doc, rule)` → `Option<String>` — single value from document
 - `extract_within(elem, rule)` → `Option<String>` — single value within an element
+- `extract_all_doc(doc, rule)` → `Vec<String>` — all matches (used by `fetch_content` for multi-`<p>` content rules)
 
 The `||` fallback and `&`-self handling are easy to break — touch
-`rule.rs` with care and re-run its unit tests.
+`rule.rs` with care and re-run `cargo test catalog::service::rule::tests`
+(4 tests today).
 
-### BookSource shape (`src/source/mod.rs`)
+### BookSource shape (`src/catalog/service/source.rs`)
 
 Four rule groups mirror the four scraping stages:
 
@@ -121,30 +148,54 @@ Four rule groups mirror the four scraping stages:
 `ruleSearch.url` substitutes `{{key}}` (and the legacy `searchKey` literal)
 with the URL-encoded keyword.
 
-### Scraper invariants (`src/scraper.rs`)
+### Scraper invariants (`src/catalog/service/scraper.rs`)
 
 - HTTP client is `wreq::Client` with `Emulation::Chrome131` — sends real
   Chrome JA3 / JA4 / HTTP-2 fingerprints so Cloudflare-protected sites
   (uukanshu.cc etc.) don't 403 us at the TLS layer. Do **not** swap back to
   `reqwest` without keeping an equivalent impersonation layer.
 - All relative URLs are resolved against the page's *final* URL (after redirects);
-  use `resp.uri()` (not `.url()` — wreq's API)
+  use `resp.uri()` (not `.url()` — wreq's API). The URL-join helper lives in
+  `src/utils/url.rs::resolve` — share it with future scrapers, don’t re-inline.
 - `fetch_content` post-processes HTML through `normalize_paragraphs` — `<br>` /
   `</p>` become real newlines, entities decode, remaining tags strip;
   uses `extract_all_doc` (NOT `extract_doc`) because a content rule typically
-  matches many `<p>` elements
+  matches many `<p>` elements.
 - Headers JSON from `BookSource.header` is applied to every request when present;
-  invalid JSON is silently ignored
+  invalid JSON is silently ignored.
 
-### Storage (`src/storage.rs`)
+### Storage — Library DAO + Catalog DAO
 
 Four tables: `sources`, `novels`, `chapters`, `progress`.
-- `novels.book_url` is the natural key (UPSERT on conflict)
-- `replace_toc` runs in a transaction (chapters are wiped + reinserted)
-- `save_chapter_content` mutates the row in-place — TOC sync does **not**
-  drop cached content if URLs are stable
 
-### TUI (`src/reader.rs`)
+- `LibraryDb` (in `library/dao.rs`) owns the `Connection`; `catalog/dao.rs`
+  borrows it via `&LibraryDb` / `&mut LibraryDb`.
+- `novels.book_url` is the natural key (UPSERT on conflict in `library::dao::upsert_novel`).
+- `catalog::dao::replace_toc` runs in a transaction: `DELETE FROM chapters WHERE
+  novel_id=?` then `INSERT … content=NULL` for each chapter. **Caveat: this nukes
+  cached content.** If you want re-sync to preserve `content` for stable URLs,
+  convert to UPSERT keyed on `(novel_id, idx)` or merge old `content` by URL
+  before reinsert. (An earlier CLAUDE.md claimed preservation; the code doesn’t.)
+- `library::dao::save_chapter_content` mutates the row in-place — safe between syncs.
+- DB path: `$XDG_DATA_HOME/novel-looker/novel-looker.db` (resolved via `dirs`).
+
+### Presentation — handlers compose facades
+
+Cross-context use cases live in `src/presentation/handlers/<cmd>.rs`, not
+in either facade. Examples:
+
+| Command | Handler composition |
+|---|---|
+| `add`  | `catalog::facade::get_source` → `catalog::facade::fetch_novel_info` → `library::facade::add_novel` |
+| `sync` | `library::facade::get_novel` → `catalog::facade::get_source` → `catalog::facade::sync_toc` |
+| `read` | `library::facade::get_chapter` (cache hit) **or** `catalog::facade::fetch_chapter_content` → `library::facade::save_chapter_content` (cache miss) |
+| `backup` | `backup::facade::run_backup(&db, &config)` — backup itself is the use case |
+
+When adding a new subcommand, add the variant to `presentation/cli.rs::Cmd`,
+create `presentation/handlers/<name>.rs`, route it in `cli::run`, and
+keep all formatting/printing in the handler.
+
+### TUI (`src/presentation/reader.rs`)
 
 Two-pane layout. The fetch is awaited **inline** inside the event loop
 (blocks UI for ~1–3s). If you make fetching truly async, add a tokio mpsc
@@ -154,38 +205,44 @@ Keybindings: `j/k` chapters | `J/K`/`Space`/`PgUp/Dn` scroll | `n/p` next/prev
 chapter | `Tab` switch focus | `g/G` head/tail | `q` quit.
 
 Progress (`chapter_index` + `scroll_offset`) is saved on every chapter change
-and on quit.
+and on quit via `library::facade::save_progress`.
+
+### Backup / config (`src/backup/`, `src/config.rs`)
+
+- Config lives at `$XDG_CONFIG_HOME/novel-looker/config.toml` (separate from the
+  data DB — config travels via dotfiles, data via `backup`).
+- Snapshot JSON (`backup/service/snapshot.rs`) deliberately **omits chapter content**
+  — re-sync is cheap (~1s per book), but losing reading progress is the actual user pain.
+- `backup.backend` is currently `local` or `webdav`; Google Drive is reachable
+  via `local` + Drive Desktop's synced folder (no OAuth needed). Adding a
+  native Google backend would mean a new `backup::service::transport::push_google`
+  alongside `push_local` / `push_webdav` — **not** a new top-level module.
+- WebDAV password is read from `$NOVEL_LOOKER_WEBDAV_PASS` first, then from
+  the config file. Prefer the env var — config files end up in screenshots and
+  git diffs.
 
 ## Claude plugin scaffolding
 
-- `.claude/plugin.json` — manifest, references the two skills
+- `.claude/plugin.json` — manifest, references the skills
 - `.claude/skills/parse-novel-site/SKILL.md` — given a URL, produce a
   validated `book-sources/<site>.json`; the skill spec defines the validation
-  commands and the rule DSL (keep that section in sync with `rule.rs`)
+  commands and the rule DSL (keep that section in sync with
+  `src/catalog/service/rule.rs`)
 - `.claude/skills/add-to-shelf/SKILL.md` — wraps `add → sync → tui`
+- `.claude/skills/legado-converter/SKILL.md` — port Legado / 閱讀 3.0 JSON sources
 
 When changing the rule grammar or `BookSource` fields, update
 `parse-novel-site/SKILL.md` so generated sources stay valid.
 
-### Backup / config (`src/backup.rs`, `src/config.rs`)
-
-- Config lives at `$XDG_CONFIG_HOME/novel-looker/config.toml` (separate from the
-  data DB — config travels via dotfiles, data via `backup`)
-- Snapshot JSON deliberately **omits chapter content** — re-sync is cheap (~1s
-  per book), but losing reading progress is the actual user pain
-- `backup.backend` is currently `local` or `webdav`; Google Drive is reachable
-  via `local` + Drive Desktop's synced folder (no OAuth needed). Adding a
-  native Google backend would require a separate `backup::push_google` service
-  alongside the existing local/webdav ones
-- WebDAV password is read from `$NOVEL_LOOKER_WEBDAV_PASS` first, then from
-  the config file. Prefer the env var — config files end up in screenshots and
-  git diffs
-
 ## What not to touch unprompted
 
-- The `bookSourceUrl`-as-PK contract in `storage.rs` — `source list` and
-  pattern-matching in `add-to-shelf` both depend on it being a stable URL
+- The `bookSourceUrl`-as-PK contract in `library::dao` (sources table) — `source list`
+  and pattern-matching in `add-to-shelf` both depend on it being a stable URL.
 - Field names in `BookSource` (and `#[serde(rename = ...)]` mappings) — JSON
-  sources in the wild use this exact camelCase
-- Dead-code helpers in `rule.rs` (`select_within`, `extract_all_doc`) — kept
-  for the reader/skills to use; warnings are expected
+  sources in the wild use this exact camelCase.
+- Cross-context layering: never let `service/*.rs` files import `rusqlite` or
+  any `dao` module — the bounded-context split depends on this. Backup must
+  not import `library::dao` directly; go through `library::facade`.
+- Dead-code helpers in `catalog/service/rule.rs` (`select_within`) and the
+  `BackupReceipt.filename` field — kept for skills / future readers / debug;
+  the two `dead_code` warnings are expected and should stay.
