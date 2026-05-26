@@ -1,9 +1,22 @@
+//! Library DAO + SQLite Connection owner.
+//!
+//! NOTE: Shared Kernel — sources 表 + chapters.{idx,name,url} columns 由 Catalog DAO
+//! 寫；chapters.content 由 Library DAO 寫。修改任一方 schema 需同步檢視對方 DAO。
+//!
+//! Layering: this module is the sole `rusqlite` import point for the Library
+//! context. Service / facade layers depend on this DAO via `&LibraryDb` /
+//! `&mut LibraryDb` and never touch `rusqlite` types directly.
+//!
+//! Borrow rules (per design.md):
+//! - SELECT (唯讀)        → `&self`
+//! - INSERT/UPDATE (寫入) → `&mut self`
+//! - Transaction          → `&mut self`
+
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::PathBuf;
 
-use crate::models::{Chapter, ChapterMeta, Novel, ReadProgress};
-use crate::source::BookSource;
+use crate::library::{Chapter, ChapterMeta, Novel, ReadProgress};
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS sources (
@@ -46,11 +59,11 @@ CREATE TABLE IF NOT EXISTS progress (
 );
 "#;
 
-pub struct Storage {
+pub struct LibraryDb {
     conn: Connection,
 }
 
-impl Storage {
+impl LibraryDb {
     pub fn open() -> Result<Self> {
         let path = data_dir()?.join("novel-looker.db");
         if let Some(parent) = path.parent() {
@@ -62,52 +75,19 @@ impl Storage {
         Ok(Self { conn })
     }
 
-    // ---- sources ----
-
-    pub fn save_source(&self, src: &BookSource) -> Result<()> {
-        let json = serde_json::to_string(src)?;
-        let now = chrono::Utc::now().to_rfc3339();
-        self.conn.execute(
-            "INSERT INTO sources(url,name,group_name,enabled,json,updated_at) VALUES(?,?,?,?,?,?)
-             ON CONFLICT(url) DO UPDATE SET name=excluded.name,group_name=excluded.group_name,
-                enabled=excluded.enabled,json=excluded.json,updated_at=excluded.updated_at",
-            params![
-                src.book_source_url,
-                src.book_source_name,
-                src.book_source_group,
-                src.enabled as i64,
-                json,
-                now,
-            ],
-        )?;
-        Ok(())
+    /// Shared Connection accessor for sibling DAOs (Catalog / Backup).
+    pub fn conn(&self) -> &Connection {
+        &self.conn
     }
 
-    pub fn list_sources(&self) -> Result<Vec<BookSource>> {
-        let mut stmt = self.conn.prepare("SELECT json FROM sources ORDER BY name")?;
-        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for r in rows {
-            let json = r?;
-            out.push(serde_json::from_str(&json)?);
-        }
-        Ok(out)
-    }
-
-    pub fn get_source(&self, url: &str) -> Result<Option<BookSource>> {
-        let json: Option<String> = self
-            .conn
-            .query_row("SELECT json FROM sources WHERE url=?", [url], |r| r.get(0))
-            .optional()?;
-        Ok(match json {
-            Some(j) => Some(serde_json::from_str(&j)?),
-            None => None,
-        })
+    /// Mutable Connection accessor for sibling DAOs that need transactions.
+    pub fn conn_mut(&mut self) -> &mut Connection {
+        &mut self.conn
     }
 
     // ---- novels ----
 
-    pub fn upsert_novel(&self, n: &Novel) -> Result<i64> {
+    pub fn upsert_novel(&mut self, n: &Novel) -> Result<i64> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO novels(source_url,book_url,name,author,intro,cover_url,toc_url,added_at)
@@ -170,21 +150,7 @@ impl Storage {
     }
 
     // ---- chapters ----
-
-    pub fn replace_toc(&mut self, novel_id: i64, chapters: &[ChapterMeta]) -> Result<()> {
-        let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM chapters WHERE novel_id=?", [novel_id])?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO chapters(novel_id,idx,name,url,content) VALUES(?,?,?,?,NULL)",
-            )?;
-            for c in chapters {
-                stmt.execute(params![novel_id, c.index, c.name, c.url])?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
+    // (replace_toc lives in catalog::dao — Shared Kernel: Catalog owns TOC writes.)
 
     pub fn list_chapters(&self, novel_id: i64) -> Result<Vec<ChapterMeta>> {
         let mut stmt = self.conn.prepare(
@@ -211,7 +177,7 @@ impl Storage {
         Ok(row.and_then(|(m, c)| c.map(|content| Chapter { meta: m, content })))
     }
 
-    pub fn save_chapter_content(&self, novel_id: i64, idx: i64, content: &str) -> Result<()> {
+    pub fn save_chapter_content(&mut self, novel_id: i64, idx: i64, content: &str) -> Result<()> {
         self.conn.execute(
             "UPDATE chapters SET content=? WHERE novel_id=? AND idx=?",
             params![content, novel_id, idx],
@@ -221,7 +187,7 @@ impl Storage {
 
     // ---- progress ----
 
-    pub fn save_progress(&self, p: &ReadProgress) -> Result<()> {
+    pub fn save_progress(&mut self, p: &ReadProgress) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO progress(novel_id,chapter_index,scroll_offset,updated_at) VALUES(?,?,?,?)

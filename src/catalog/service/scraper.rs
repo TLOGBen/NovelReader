@@ -1,11 +1,12 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use scraper::Html;
-use url::Url;
 use wreq::Client;
 use wreq_util::Emulation;
 
-use crate::models::{ChapterMeta, Novel, SearchHit};
-use crate::source::{rule, BookSource};
+use crate::library::{ChapterMeta, Novel};
+use crate::catalog::SearchHit;
+use crate::catalog::service::rule;
+use crate::catalog::BookSource;
 
 pub struct Scraper {
     client: Client,
@@ -44,7 +45,7 @@ impl Scraper {
         let url = url_tpl
             .replace("{{key}}", &urlencoding::encode(keyword))
             .replace("searchKey", &urlencoding::encode(keyword));
-        let url = resolve(&src.book_source_url, &url)?;
+        let url = crate::utils::url::resolve(&src.book_source_url, &url)?;
 
         let (final_url, body) = self.fetch(&url, &src.header).await?;
         let doc = Html::parse_document(&body);
@@ -66,7 +67,7 @@ impl Scraper {
                 source_url: src.book_source_url.clone(),
                 name,
                 author,
-                book_url: resolve(&final_url, &book_url)?,
+                book_url: crate::utils::url::resolve(&final_url, &book_url)?,
                 kind,
                 intro,
             });
@@ -83,9 +84,9 @@ impl Scraper {
         let author = pick_doc(&doc, src.rule_book_info.author.as_deref())?;
         let intro = pick_doc(&doc, src.rule_book_info.intro.as_deref())?;
         let cover = pick_doc(&doc, src.rule_book_info.cover_url.as_deref())?
-            .map(|c| resolve(&final_url, &c).unwrap_or(c));
+            .map(|c| crate::utils::url::resolve(&final_url, &c).unwrap_or(c));
         let toc_url = pick_doc(&doc, src.rule_book_info.toc_url.as_deref())?
-            .map(|t| resolve(&final_url, &t).unwrap_or(t))
+            .map(|t| crate::utils::url::resolve(&final_url, &t).unwrap_or(t))
             .or(Some(final_url.clone()));
 
         Ok(Novel {
@@ -115,7 +116,7 @@ impl Scraper {
             let name = rule::extract_within(n, name_rule)?
                 .unwrap_or_else(|| format!("Chapter {}", i + 1));
             let Some(href) = rule::extract_within(n, url_rule)? else { continue };
-            let abs = resolve(&final_url, &href)?;
+            let abs = crate::utils::url::resolve(&final_url, &href)?;
             chapters.push(ChapterMeta { index: i as i64, name, url: abs });
         }
         Ok(chapters)
@@ -157,12 +158,6 @@ fn pick_doc(doc: &Html, rule_str: Option<&str>) -> Result<Option<String>> {
         Some(r) => rule::extract_doc(doc, r),
         None => Ok(None),
     }
-}
-
-fn resolve(base: &str, href: &str) -> Result<String> {
-    let base = Url::parse(base).with_context(|| format!("bad base url {base}"))?;
-    let resolved = base.join(href).with_context(|| format!("bad relative url {href}"))?;
-    Ok(resolved.to_string())
 }
 
 /// Collapse HTML / weird whitespace into clean paragraphs.
