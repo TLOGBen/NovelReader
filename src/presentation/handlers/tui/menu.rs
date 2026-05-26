@@ -26,6 +26,10 @@ const ITEMS: [&str; 4] = ["書架", "搜尋蒐書", "設定", "離開"];
 pub struct MenuScreen {
     selected: usize,
     settings_stub_msg: Option<&'static str>,
+    /// 動態 toast（owned String）— 由 `with_toast` 帶入，供 SearchScreen 入架
+    /// 成功跳回主菜單時顯示「已入架 #ID 書名」。任意鍵清除（與 `settings_stub_msg`
+    /// 同樣的暫時性訊息語意）。
+    toast: Option<String>,
 }
 
 impl MenuScreen {
@@ -34,6 +38,18 @@ impl MenuScreen {
         Self {
             selected: 0,
             settings_stub_msg: None,
+            toast: None,
+        }
+    }
+
+    /// 帶 toast 構造 — SearchScreen 入架成功後 `Transition::To(...)` 用，
+    /// 在主菜單頂端顯示「已入架 #ID 書名」一行。首次按鍵清除。
+    #[allow(dead_code)]
+    pub fn with_toast(toast: String) -> Self {
+        Self {
+            selected: 0,
+            settings_stub_msg: None,
+            toast: Some(toast),
         }
     }
 }
@@ -77,9 +93,10 @@ impl Screen for MenuScreen {
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
-        let status_text = match self.settings_stub_msg {
-            Some(msg) => format!("j/k 上下、Enter 進入、q 離開\n{}", msg),
-            None => "j/k 上下、Enter 進入、q 離開".to_string(),
+        let status_text = match (&self.toast, self.settings_stub_msg) {
+            (Some(t), _) => format!("j/k 上下、Enter 進入、q 離開\n{}", t),
+            (None, Some(msg)) => format!("j/k 上下、Enter 進入、q 離開\n{}", msg),
+            (None, None) => "j/k 上下、Enter 進入、q 離開".to_string(),
         };
         frame.render_widget(Paragraph::new(status_text), chunks[2]);
     }
@@ -89,6 +106,7 @@ impl Screen for MenuScreen {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.selected = (self.selected + 1) % ITEMS.len();
                 self.settings_stub_msg = None;
+                self.toast = None;
                 Transition::Stay
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -98,16 +116,16 @@ impl Screen for MenuScreen {
                     self.selected - 1
                 };
                 self.settings_stub_msg = None;
+                self.toast = None;
                 Transition::Stay
             }
             KeyCode::Enter => match self.selected {
                 0 => Transition::To(Box::new(
                     crate::presentation::handlers::tui::shelf::ShelfScreen::new(),
                 )),
-                1 => {
-                    self.settings_stub_msg = Some("（搜尋等 tui-04 實裝）");
-                    Transition::Stay
-                }
+                1 => Transition::To(Box::new(
+                    crate::presentation::handlers::tui::search::SearchScreen::new(),
+                )),
                 2 => {
                     self.settings_stub_msg = Some("尚未實作");
                     Transition::Stay
@@ -118,6 +136,7 @@ impl Screen for MenuScreen {
             KeyCode::Char('q') => Transition::Quit,
             _ => {
                 self.settings_stub_msg = None;
+                self.toast = None;
                 Transition::Stay
             }
         }
@@ -214,6 +233,13 @@ mod tests {
         let mut ctx = test_ctx();
         let t = m.handle_event(press(KeyCode::Char('m')), &mut ctx).await;
         assert!(matches!(t, Transition::Stay));
+    }
+
+    #[test]
+    fn with_toast_stores_message() {
+        let m = MenuScreen::with_toast("已入架 #5 超維術士".to_string());
+        assert_eq!(m.selected, 0);
+        assert_eq!(m.toast.as_deref(), Some("已入架 #5 超維術士"));
     }
 
     #[tokio::test]
