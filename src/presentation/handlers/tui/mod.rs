@@ -30,6 +30,8 @@ use std::time::Duration;
 
 use crate::presentation::AppContext;
 
+pub mod widgets;
+
 // ============================================================================
 // v1 entry point (kept stable; cli.rs is "不動" until TASK-tui-02 migration).
 // ============================================================================
