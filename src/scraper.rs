@@ -123,9 +123,22 @@ impl Scraper {
         let doc = Html::parse_document(&body);
         let content_rule = src.rule_content.content.as_deref()
             .ok_or_else(|| anyhow!("missing ruleContent.content"))?;
-        let raw = rule::extract_doc(&doc, content_rule)?
-            .unwrap_or_default();
-        Ok(normalize_paragraphs(&raw))
+        // Content rule selects MANY nodes (paragraphs); concatenate them all.
+        let parts = rule::extract_all_doc(&doc, content_rule)?;
+        let raw = if parts.is_empty() {
+            rule::extract_doc(&doc, content_rule)?.unwrap_or_default()
+        } else {
+            parts.join("\n\n")
+        };
+        let mut text = normalize_paragraphs(&raw);
+        if let Some(re_str) = src.rule_content.replace_regex.as_deref() {
+            if !re_str.is_empty() {
+                if let Ok(re) = regex::Regex::new(re_str) {
+                    text = re.replace_all(&text, "").into_owned();
+                }
+            }
+        }
+        Ok(text)
     }
 }
 

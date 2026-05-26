@@ -5,6 +5,7 @@
   "author": "TLOGBen",
   "skills": [
     ".claude/skills/parse-novel-site",
-    ".claude/skills/add-to-shelf"
+    ".claude/skills/add-to-shelf",
+    ".claude/skills/legado-converter"
   ]
 }
