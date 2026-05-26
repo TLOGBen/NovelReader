@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# HTTP + HTML
-reqwest = { version = "0.12", features = ["gzip", "brotli", "rustls-tls"], default-features = false }
+# HTTP + HTML (wreq impersonates real browser TLS/JA3 to bypass Cloudflare bot checks)
+wreq = "6.0.0-rc"
+wreq-util = "3.0.0-rc"
 scraper = "0.20"
 url = "2.5"
 

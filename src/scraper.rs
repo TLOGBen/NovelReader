@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use reqwest::Client;
 use scraper::Html;
 use url::Url;
+use wreq::Client;
+use wreq_util::Emulation;
 
 use crate::models::{ChapterMeta, Novel, SearchHit};
 use crate::source::{rule, BookSource};
@@ -12,8 +13,10 @@ pub struct Scraper {
 
 impl Scraper {
     pub fn new() -> Result<Self> {
+        // Impersonate Chrome's TLS / JA3 / HTTP-2 fingerprint so Cloudflare-protected
+        // sites (e.g., uukanshu.cc) don't reject our requests at the TLS layer.
         let client = Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) novel-looker/0.1")
+            .emulation(Emulation::Chrome131)
             .build()?;
         Ok(Self { client })
     }
@@ -30,7 +33,7 @@ impl Scraper {
             }
         }
         let resp = req.send().await?;
-        let final_url = resp.url().to_string();
+        let final_url = resp.uri().to_string();
         let body = resp.text().await?;
         Ok((final_url, body))
     }

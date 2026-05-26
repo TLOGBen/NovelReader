@@ -12,9 +12,17 @@
 
 ## 安裝
 
+需要編譯 BoringSSL（給 wreq 用，能模擬 Chrome TLS/JA3 指紋過 Cloudflare）。
+
 ```bash
-cargo build --release
+# Debian/Ubuntu 系統 deps（一次性）
+sudo apt install -y cmake libclang-dev golang pkg-config
+
+# 編譯（LIBCLANG_PATH 指向 libclang.so 位置）
+LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --release
 ```
+
+首次編譯 ~2-3 分鐘（BoringSSL）。後續增量編譯秒回。
 
 ## 使用
 

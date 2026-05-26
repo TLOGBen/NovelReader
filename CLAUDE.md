@@ -14,12 +14,18 @@ scaffolded with `parse-novel-site` and `add-to-shelf` skills).
 ## Build / run / test
 
 ```bash
-cargo build --bin novel-looker        # debug build
-cargo build --release                 # release build
-cargo test                            # all tests
+# System deps (one-time on Debian/Ubuntu): cmake libclang-dev golang pkg-config
+LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --bin novel-looker
+LIBCLANG_PATH=/usr/lib/llvm-18/lib cargo build --release
+cargo test                            # all tests (no LIBCLANG needed once built)
 cargo test --package novel-looker rule::tests::parse_attr_and_replace   # one test
 cargo run -- <subcommand>             # run CLI without installing
 ```
+
+`LIBCLANG_PATH` is required because **wreq** depends on **BoringSSL** (via `boring`),
+which compiles native C++ and needs bindgen → libclang. The path differs per distro;
+on Ubuntu 24.04 it's `/usr/lib/llvm-18/lib`. First build takes ~2–3 min for
+BoringSSL; subsequent builds are incremental.
 
 CLI surface (run `cargo run -- help` for full list):
 
@@ -90,10 +96,18 @@ with the URL-encoded keyword.
 
 ### Scraper invariants (`src/scraper.rs`)
 
-- All relative URLs are resolved against the page's *final* URL (after redirects)
+- HTTP client is `wreq::Client` with `Emulation::Chrome131` — sends real
+  Chrome JA3 / JA4 / HTTP-2 fingerprints so Cloudflare-protected sites
+  (uukanshu.cc etc.) don't 403 us at the TLS layer. Do **not** swap back to
+  `reqwest` without keeping an equivalent impersonation layer.
+- All relative URLs are resolved against the page's *final* URL (after redirects);
+  use `resp.uri()` (not `.url()` — wreq's API)
 - `fetch_content` post-processes HTML through `normalize_paragraphs` — `<br>` /
-  `</p>` become real newlines, entities decode, remaining tags strip
-- Headers JSON from `BookSource.header` is applied to every request when present
+  `</p>` become real newlines, entities decode, remaining tags strip;
+  uses `extract_all_doc` (NOT `extract_doc`) because a content rule typically
+  matches many `<p>` elements
+- Headers JSON from `BookSource.header` is applied to every request when present;
+  invalid JSON is silently ignored
 
 ### Storage (`src/storage.rs`)
 

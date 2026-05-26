@@ -14,31 +14,49 @@ description: 把一本小說加進 novel-looker 書架、同步章節、開啟 T
 
 ## 流程
 
+> 預設 `BIN=./target/debug/novel-looker`（或 release 版）。若使用者給的是**章節 URL**
+> （如 `.../book/21940/12662515.html`），先用 regex 推回**詳情頁 URL**：通常砍掉
+> 最後一段 `\d+\.html` 即可。確認推出來的 URL 跟 `bookUrlPattern` 對得上。
+
 1. 從 URL 推測屬於哪個書源：
    ```bash
-   cargo run -- source list
+   $BIN source list
    ```
-   比對 `bookUrlPattern`，找到匹配的 `bookSourceUrl`。若無匹配，先呼叫 `parse-novel-site` skill 產生書源。
+   比對每個 `bookUrlPattern`（regex），找到 match 的 `bookSourceUrl`。若無 match，
+   先呼叫 `parse-novel-site` skill 產生新書源再回來。
 
 2. 加入書架：
    ```bash
-   cargo run -- add --source <book_source_url> <book_url>
+   $BIN add --source <book_source_url> <book_url>
    ```
-   印出 `#<novel_id>`。
+   印出 `#<novel_id>` + 書名 + 作者。
 
 3. 同步章節：
    ```bash
-   cargo run -- sync <novel_id>
+   $BIN sync <novel_id>
    ```
+   印出「✓ 同步 N 章」。
 
-4. 詢問使用者要不要立刻 `tui <novel_id>`，還是只先加進去。
+4. 詢問使用者要不要立刻 `$BIN tui <novel_id>`、列出指定章節 `$BIN read <id> <idx>`，
+   或先加進去之後再看。若使用者本來就在看某一章，幫他算出 `idx`：
+   ```bash
+   sqlite3 ~/.local/share/novel-looker/novel-looker.db \
+     "SELECT idx, name FROM chapters WHERE novel_id=<id> AND url LIKE '%<chapter_slug>%'"
+   ```
 
 ## 驗證
 
-- `cargo run -- shelf` 能看到新書
-- `cargo run -- sync` 印出的章節數 > 0
+- `$BIN shelf` 能看到新書、書名作者不是 `Unknown / -`
+- `$BIN sync` 章節數 > 0
 
 ## 失敗處理
 
-- 若 `add` 拿到 `name=Unknown` → ruleBookInfo 失準，跳回 parse-novel-site 修書源
-- 若 `sync` 章節數 = 0 → ruleToc 失準，同上
+| 症狀 | 通常原因 | 處置 |
+|---|---|---|
+| `add` 印 `Unknown / -` | `ruleBookInfo.name` / `author` 選擇器漂掉 | 開 Chrome 看詳情頁，更新 selector |
+| `sync 0 章` | `ruleToc.chapterList` 對不上目錄頁 DOM | 同上看目錄頁 |
+| `read` 完全空 | `ruleContent.content` 對不上內文容器 | 同上看章節頁 |
+| `add` / `sync` hang 很久後失敗 | 站點封 IP 或要登入 | 改用 VPN / 該書源加 cookie header |
+
+> ⚠ Cloudflare TLS 攔截**不再是問題**——scraper 用 wreq + Chrome 指紋
+> 已自動處理。若 add 還是 fail，**就是規則或網路**，不是 TLS。
