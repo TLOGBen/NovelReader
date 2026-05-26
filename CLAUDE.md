@@ -120,8 +120,13 @@ Every selector in a `BookSource` is a string in this grammar:
 
 - `accessor`: `text` (default) | `html` | `outerHtml` | any HTML attribute name
 - `||` joins fallback alternatives; first non-empty wins
-- `&` as the selector means "the current element itself"
-  (used inside a list iteration, e.g. `chapterName: "&@text"`)
+- `&` as the selector is **intended** to mean "the current element itself"
+  but is **currently broken in `extract_within`**: `Selector::parse("&")` is
+  called before the `alt.selector == "&"` self-check at `rule.rs:148`, so
+  any `&`-rule errors with `EmptySelector` before the override runs. Until
+  fixed, structure `ruleToc` to select the wrapper element (e.g. `> li`)
+  and put `a@text` / `a@href` in `chapterName` / `chapterUrl` so child
+  selectors do the work.
 
 The rule engine exposes four entry points consumed by `scraper.rs`:
 - `select_nodes(doc, rule)` — element list from a document (for `bookList`, `chapterList`)
@@ -176,6 +181,13 @@ Four tables: `sources`, `novels`, `chapters`, `progress`.
   cached content.** If you want re-sync to preserve `content` for stable URLs,
   convert to UPSERT keyed on `(novel_id, idx)` or merge old `content` by URL
   before reinsert. (An earlier CLAUDE.md claimed preservation; the code doesn’t.)
+- `chapters.idx` is the literal `enumerate()` index from `fetch_toc`, **not** a
+  dense 0..N-1 sequence. Any node that `select_nodes` returned but `fetch_toc`
+  skipped (no `href` → `continue`) leaves a hole at that idx and shifts every
+  following chapter by one. Example: czbooks's `<li class="volume">正文卷</li>`
+  is the first match, gets `i=0`, is skipped because it has no `<a>`, and the
+  real 第1章 ends up at `idx=1`. To set a reading progress by chapter label,
+  query `chapters` first — don't assume `第N章 → idx=N-1`.
 - `library::dao::save_chapter_content` mutates the row in-place — safe between syncs.
 - DB path: `$XDG_DATA_HOME/novel-looker/novel-looker.db` (resolved via `dirs`).
 
@@ -187,9 +199,16 @@ in either facade. Examples:
 | Command | Handler composition |
 |---|---|
 | `add`  | `catalog::facade::get_source` → `catalog::facade::fetch_novel_info` → `library::facade::add_novel` |
+| `search` | iterates **all** `enabled` sources when `--source` is omitted; per-source error is printed and the next source still runs |
 | `sync` | `library::facade::get_novel` → `catalog::facade::get_source` → `catalog::facade::sync_toc` |
 | `read` | `library::facade::get_chapter` (cache hit) **or** `catalog::facade::fetch_chapter_content` → `library::facade::save_chapter_content` (cache miss) |
 | `backup` | `backup::facade::run_backup(&db, &config)` — backup itself is the use case |
+
+There is **no** subcommand to re-bind an existing shelf row to a different
+`book_source_url` (i.e. no “換源”). `novels.book_source_url` is set once by
+`library::dao::upsert_novel` at `add` time; to switch source you currently
+have to delete the row from `novels` and re-`add` from the new URL — which
+also drops cached TOC + content + progress via the `ON DELETE CASCADE`.
 
 When adding a new subcommand, add the variant to `presentation/cli.rs::Cmd`,
 create `presentation/handlers/<name>.rs`, route it in `cli::run`, and
