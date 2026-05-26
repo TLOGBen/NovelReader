@@ -1,3 +1,8 @@
+//! ratatui TUI reader.
+//! ReaderApp 內含 reading session state (current_chapter, scroll, content cache) —
+//! 未來若拆出 Reading bounded context (OQ-2: annotation / highlight / 多 session) 會搬出。
+//! 目前居此處 with full Reading concept inline.
+
 use anyhow::{anyhow, Result};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -15,10 +20,12 @@ use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::time::Duration;
 
-use crate::models::{ChapterMeta, Novel, ReadProgress};
-use crate::scraper::Scraper;
-use crate::source::BookSource;
-use crate::storage::Storage;
+use crate::catalog;
+use crate::catalog::BookSource;
+use crate::catalog::service::scraper::Scraper;
+use crate::library;
+use crate::library::dao::LibraryDb;
+use crate::library::{ChapterMeta, Novel, ReadProgress};
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Focus {
@@ -56,17 +63,17 @@ impl App {
     }
 }
 
-pub async fn run(store: &mut Storage, novel_id: i64) -> Result<()> {
-    let novel = store.get_novel(novel_id)?
+pub async fn run(store: &mut LibraryDb, novel_id: i64) -> Result<()> {
+    let novel = library::facade::get_novel(store, novel_id)?
         .ok_or_else(|| anyhow!("找不到小說 #{novel_id}"))?;
-    let chapters = store.list_chapters(novel_id)?;
+    let chapters = library::facade::list_chapters(store, novel_id)?;
     if chapters.is_empty() {
         anyhow::bail!("尚無章節，請先 `sync {novel_id}`");
     }
-    let src = store.get_source(&novel.source_url)?
+    let src = catalog::facade::get_source(store, &novel.source_url)?
         .ok_or_else(|| anyhow!("書源不存在: {}", novel.source_url))?;
 
-    let progress = store.get_progress(novel_id)?;
+    let progress = library::facade::get_progress(store, novel_id)?;
     let start_idx = progress.as_ref().map(|p| p.chapter_index as usize).unwrap_or(0);
     let start_scroll = progress.as_ref().map(|p| p.scroll_offset).unwrap_or(0);
 
@@ -92,7 +99,7 @@ pub async fn run(store: &mut Storage, novel_id: i64) -> Result<()> {
     term.show_cursor()?;
 
     // Save progress.
-    store.save_progress(&ReadProgress {
+    library::facade::save_progress(store, &ReadProgress {
         novel_id,
         chapter_index: app.current as i64,
         scroll_offset: app.scroll,
@@ -104,7 +111,7 @@ pub async fn run(store: &mut Storage, novel_id: i64) -> Result<()> {
 async fn event_loop<B: ratatui::backend::Backend>(
     term: &mut Terminal<B>,
     app: &mut App,
-    store: &mut Storage,
+    store: &mut LibraryDb,
     src: &BookSource,
     scraper: &Scraper,
     novel_id: i64,
@@ -201,7 +208,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
         if let Some(next) = chapter_change {
             // Save progress for the chapter we're leaving.
-            store.save_progress(&ReadProgress {
+            library::facade::save_progress(store, &ReadProgress {
                 novel_id,
                 chapter_index: app.current as i64,
                 scroll_offset: app.scroll,
@@ -217,7 +224,7 @@ async fn event_loop<B: ratatui::backend::Backend>(
 
 async fn load_chapter(
     app: &mut App,
-    store: &mut Storage,
+    store: &mut LibraryDb,
     src: &BookSource,
     scraper: &Scraper,
     novel_id: i64,
@@ -230,15 +237,15 @@ async fn load_chapter(
         return;
     };
 
-    let content = match store.get_chapter(novel_id, idx as i64) {
+    let content = match library::facade::get_chapter(store, novel_id, idx as i64) {
         Ok(Some(c)) => Some(c.content),
         _ => None,
     };
     let text = match content {
         Some(c) => c,
-        None => match scraper.fetch_content(src, &meta.url).await {
+        None => match catalog::facade::fetch_chapter_content(scraper, src, &meta.url).await {
             Ok(c) => {
-                let _ = store.save_chapter_content(novel_id, idx as i64, &c);
+                let _ = library::facade::save_chapter_content(store, novel_id, idx as i64, &c);
                 c
             }
             Err(e) => {

@@ -1,5 +1,3 @@
-pub mod rule;
-
 use serde::{Deserialize, Serialize};
 
 /// 書源 (Book Source) — 描述如何從一個小說網站抓取資料的 JSON 設定。

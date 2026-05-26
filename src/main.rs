@@ -1,17 +1,20 @@
 mod backup;
-mod cli;
+mod catalog;
 mod config;
-mod models;
-mod reader;
-mod scraper;
-mod source;
-mod storage;
+mod library;
+mod presentation;
+mod utils;
 
 use anyhow::Result;
 use clap::Parser;
 
+use presentation::cli::Cli;
+use presentation::AppContext;
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = cli::Cli::parse();
-    cli::run(cli).await
+    let cli = Cli::parse();
+    let config = crate::config::Config::load()?;
+    let mut ctx = AppContext::bootstrap(config)?;
+    presentation::cli::run(cli, &mut ctx).await
 }
