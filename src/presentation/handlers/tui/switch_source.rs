@@ -173,6 +173,8 @@ impl Screen for SwitchSourceScreen {
                         .await
                         {
                             Ok(outcome) => {
+                                // 規格 line 145：成功時用 None highlight + toast。
+                                // 不再 highlight 新 book_url（即使 UX 上會更友善）。
                                 let toast = format!(
                                     "✓ 已換源至 {}，進度重置到第 {} 章: {}",
                                     source_url,
@@ -180,7 +182,7 @@ impl Screen for SwitchSourceScreen {
                                     outcome.new_first_chapter_name
                                 );
                                 Transition::To(Box::new(ShelfScreen::with_highlight(
-                                    Some(book_url),
+                                    None,
                                     Some(toast),
                                 )))
                             }
