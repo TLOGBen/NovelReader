@@ -149,6 +149,31 @@ impl LibraryDb {
         Ok(n)
     }
 
+    /// Lookup by natural key (`book_url`) — used by SearchScreen to detect
+    /// whether a candidate book is already on the shelf before re-adding.
+    pub fn get_novel_by_book_url(&self, book_url: &str) -> Result<Option<Novel>> {
+        let n = self
+            .conn
+            .query_row(
+                "SELECT id,source_url,book_url,name,author,intro,cover_url,toc_url FROM novels WHERE book_url=?",
+                [book_url],
+                |r| {
+                    Ok(Novel {
+                        id: Some(r.get(0)?),
+                        source_url: r.get(1)?,
+                        book_url: r.get(2)?,
+                        name: r.get(3)?,
+                        author: r.get(4)?,
+                        intro: r.get(5)?,
+                        cover_url: r.get(6)?,
+                        toc_url: r.get(7)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(n)
+    }
+
     // ---- chapters ----
     // (replace_toc lives in catalog::dao — Shared Kernel: Catalog owns TOC writes.)
 
@@ -660,6 +685,39 @@ mod tests {
         assert_eq!(returned, 5);
         let p = f.db.get_progress(f.novel_id).unwrap().unwrap();
         assert_eq!(p.chapter_index, 5);
+    }
+
+    // ---- get_novel_by_book_url ----
+
+    #[test]
+    fn get_novel_by_book_url_returns_some_when_present() {
+        let mut db = LibraryDb::open_in_memory().expect("open in-memory db");
+        let book_url = "https://example.com/book/42";
+        let novel = make_novel("https://example.com/src", book_url);
+        let inserted_id = db.upsert_novel(&novel).expect("upsert novel");
+
+        let got = db
+            .get_novel_by_book_url(book_url)
+            .expect("query should succeed")
+            .expect("novel should exist");
+
+        assert_eq!(got.id, Some(inserted_id));
+        assert_eq!(got.source_url, "https://example.com/src");
+        assert_eq!(got.book_url, book_url);
+        assert_eq!(got.name, "Test Novel");
+        assert_eq!(got.author.as_deref(), Some("Author"));
+        assert_eq!(got.intro.as_deref(), Some("Intro"));
+        assert_eq!(got.cover_url, None);
+        assert_eq!(got.toc_url, None);
+    }
+
+    #[test]
+    fn get_novel_by_book_url_returns_none_when_absent() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+        let got = db
+            .get_novel_by_book_url("https://nonexistent.example/no-such-book")
+            .expect("query should succeed");
+        assert!(got.is_none());
     }
 
     // ---- Defensive: empty new_chapters ----

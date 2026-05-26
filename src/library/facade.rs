@@ -29,6 +29,29 @@ pub fn get_novel(db: &LibraryDb, id: i64) -> Result<Option<Novel>> {
     db.get_novel(id)
 }
 
+/// SearchScreen — duplicate-add detection by natural key (`book_url`).
+pub fn get_novel_by_book_url(db: &LibraryDb, book_url: &str) -> Result<Option<Novel>> {
+    db.get_novel_by_book_url(book_url)
+}
+
+/// REQ-005 switch-source — thin pass-through over the dao transaction.
+///
+/// Caller (presentation handler) is responsible for the upstream catalog
+/// pipeline (`get_source` → `fetch_novel_info` → `fetch_toc`) and for the
+/// five-class pre-checks. This facade only wraps the atomic dao step —
+/// never imports `catalog::*` (REQ-007 layer invariant).
+///
+/// Returns the new `progress.chapter_index` (= first idx of `new_chapters`).
+pub fn switch_source_tx(
+    db: &mut LibraryDb,
+    novel_id: i64,
+    new_src_url: &str,
+    new_book_url: &str,
+    new_chapters: &[ChapterMeta],
+) -> Result<i64> {
+    db.update_book_source_tx(novel_id, new_src_url, new_book_url, new_chapters)
+}
+
 /// TUI reader — list chapters for a novel.
 pub fn list_chapters(db: &LibraryDb, novel_id: i64) -> Result<Vec<ChapterMeta>> {
     db.list_chapters(novel_id)
