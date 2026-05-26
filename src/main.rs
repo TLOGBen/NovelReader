@@ -15,6 +15,6 @@ use presentation::AppContext;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config = crate::config::Config::load()?;
-    let mut ctx = AppContext::bootstrap(config)?;
-    presentation::cli::run(cli, &mut ctx).await
+    let ctx = AppContext::bootstrap(config)?;
+    presentation::cli::run(cli, ctx).await
 }
