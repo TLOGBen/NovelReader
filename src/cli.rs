@@ -2,6 +2,8 @@ use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+use crate::backup;
+use crate::config::Config;
 use crate::reader;
 use crate::scraper::Scraper;
 use crate::source::BookSource;
@@ -51,6 +53,36 @@ pub enum Cmd {
     Tui {
         novel_id: i64,
     },
+    /// 設定管理 (~/.config/novel-looker/config.toml)
+    Config {
+        #[command(subcommand)]
+        action: ConfigCmd,
+    },
+    /// 匯出書架 + 進度為 JSON（不含章節內文，可重新 sync 取回）
+    Export {
+        /// 輸出檔案路徑
+        path: PathBuf,
+    },
+    /// 從 JSON 匯入書架 + 進度（不影響已存在書源）
+    Import {
+        /// 來源檔案路徑
+        path: PathBuf,
+    },
+    /// 依據設定執行備份（export → 推到 local / webdav backend）
+    Backup,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigCmd {
+    /// 顯示目前設定
+    Show,
+    /// 設定一個 key（如 backup.local.path / backup.backend / backup.keep）
+    Set {
+        key: String,
+        value: String,
+    },
+    /// 顯示設定檔案路徑
+    Path,
 }
 
 #[derive(Subcommand, Debug)]
@@ -178,6 +210,45 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Cmd::Tui { novel_id } => {
             reader::run(&mut store, novel_id).await?;
+        }
+        Cmd::Config { action } => match action {
+            ConfigCmd::Show => {
+                let cfg = Config::load()?;
+                let text = toml::to_string_pretty(&cfg)?;
+                println!("# {}", crate::config::config_path()?.display());
+                println!("{text}");
+            }
+            ConfigCmd::Set { key, value } => {
+                let mut cfg = Config::load()?;
+                let prev = cfg.set(&key, &value)?;
+                cfg.save()?;
+                match prev {
+                    Some(p) => println!("✓ {key} = {value} (was: {p})"),
+                    None => println!("✓ {key} = {value}"),
+                }
+            }
+            ConfigCmd::Path => {
+                println!("{}", crate::config::config_path()?.display());
+            }
+        },
+        Cmd::Export { path } => {
+            let n = backup::export_to(&store, &path)?;
+            println!("✓ 匯出 {n} 本書 → {}", path.display());
+        }
+        Cmd::Import { path } => {
+            let s = backup::import_from(&store, &path)?;
+            println!(
+                "✓ 匯入 {} 本書（{} 含進度） ← {}",
+                s.added, s.with_progress, path.display()
+            );
+        }
+        Cmd::Backup => {
+            let cfg = Config::load()?;
+            let receipt = backup::run_backup(&store, &cfg).await?;
+            println!(
+                "✓ 備份 {} 本書 [{}] → {}",
+                receipt.novels, cfg.backup.backend, receipt.destination
+            );
         }
     }
     Ok(())

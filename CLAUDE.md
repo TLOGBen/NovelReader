@@ -38,6 +38,15 @@ shelf
 sync <novel_id>
 read <novel_id> <chapter_idx>     # plain stdout
 tui  <novel_id>                   # ratatui two-pane reader
+
+config show
+config set <key> <value>          # backup.backend / backup.keep
+                                  # backup.local.path
+                                  # backup.webdav.url / .username / .password
+config path
+export <path>                     # ad-hoc snapshot (shelf + progress, no content)
+import <path>                     # restore from snapshot
+backup                            # run export → push via configured backend
 ```
 
 Local SQLite DB lives at `$XDG_DATA_HOME/novel-looker/novel-looker.db`
@@ -51,12 +60,30 @@ Data flows in one direction:
 book-sources/*.json
     ↓ source::BookSource (serde)
     ↓
-Storage (SQLite)  ←→  Scraper (reqwest + scraper)
+Storage (SQLite)  ←→  Scraper (wreq + scraper)
     ↓                         ↑
 CLI (clap)  ──────────────────┘
     ↓
-reader.rs (ratatui)
+reader.rs (ratatui)         backup.rs ← config.rs
 ```
+
+### Layering rules
+
+Keep code in three layers + a utils pool. New code MUST honor this; when
+modifying existing files, gradually move logic toward the right layer rather
+than tearing down working modules in one shot.
+
+| Layer | Where | Responsibility |
+|---|---|---|
+| **action** | `cli.rs` (`Cmd` variants, `run()` match arms) | Parse CLI args, format human output, delegate to facade. **No business logic.** |
+| **facade** | Top-level functions in each domain module (e.g. `backup::run_backup`, `backup::export_to`) | Orchestrate a use case end-to-end across multiple services. One call per intent. |
+| **service** | Module-internal impls (e.g. `Storage::*`, `Scraper::*`, `backup::push_local/push_webdav`, `source::rule::*`) | Single-responsibility primitives. Don't reach across domains. |
+| **utils** | (planned: `utils/mod.rs`) | Pure helpers reused across domains (URL resolve, paragraph normalize, filename sanitize). |
+
+Right now utility helpers like `resolve` / `normalize_paragraphs` (in `scraper.rs`)
+and `backup_filename` (in `backup.rs`) still live next to their first caller.
+Move them to a shared `utils` module on next refactor pass once a second caller
+appears.
 
 ### The rule DSL (`src/source/rule.rs`) — central design
 
@@ -139,6 +166,20 @@ and on quit.
 
 When changing the rule grammar or `BookSource` fields, update
 `parse-novel-site/SKILL.md` so generated sources stay valid.
+
+### Backup / config (`src/backup.rs`, `src/config.rs`)
+
+- Config lives at `$XDG_CONFIG_HOME/novel-looker/config.toml` (separate from the
+  data DB — config travels via dotfiles, data via `backup`)
+- Snapshot JSON deliberately **omits chapter content** — re-sync is cheap (~1s
+  per book), but losing reading progress is the actual user pain
+- `backup.backend` is currently `local` or `webdav`; Google Drive is reachable
+  via `local` + Drive Desktop's synced folder (no OAuth needed). Adding a
+  native Google backend would require a separate `backup::push_google` service
+  alongside the existing local/webdav ones
+- WebDAV password is read from `$NOVEL_LOOKER_WEBDAV_PASS` first, then from
+  the config file. Prefer the env var — config files end up in screenshots and
+  git diffs
 
 ## What not to touch unprompted
 

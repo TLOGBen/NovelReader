@@ -1,4 +1,6 @@
+mod backup;
 mod cli;
+mod config;
 mod models;
 mod reader;
 mod scraper;
