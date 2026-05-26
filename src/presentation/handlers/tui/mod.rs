@@ -31,6 +31,7 @@ use std::time::Duration;
 use crate::presentation::AppContext;
 
 pub mod widgets;
+pub mod menu;
 
 // ============================================================================
 // v1 entry point (kept stable; cli.rs is "不動" until TASK-tui-02 migration).
@@ -77,8 +78,8 @@ pub enum Transition {
 /// screen 實作不需要碰。
 #[allow(dead_code)]
 pub trait Screen {
-    fn draw(&mut self, frame: &mut Frame);
-    fn handle_event(&mut self, key: KeyEvent) -> Transition;
+    fn draw(&mut self, frame: &mut Frame, ctx: &AppContext);
+    fn handle_event(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Transition;
 }
 
 /// TUI app state。
@@ -171,7 +172,12 @@ pub async fn run_loop(app: App) -> Result<()> {
     let mut app = app;
 
     loop {
-        term.terminal.draw(|f| app.current.draw(f))?;
+        // Split-borrow trick: take disjoint &mut references to `current` and
+        // `ctx` so we can pass `&ctx` into the draw closure (which would
+        // otherwise conflict with `&mut current`).
+        let App { current, ctx, .. } = &mut app;
+        let ctx_ref: &AppContext = ctx;
+        term.terminal.draw(|f| current.draw(f, ctx_ref))?;
 
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -181,10 +187,10 @@ pub async fn run_loop(app: App) -> Result<()> {
             continue;
         }
 
-        match app.current.handle_event(key) {
+        match current.handle_event(key, ctx) {
             Transition::Stay => {}
             Transition::To(next) => {
-                app.current = next;
+                *current = next;
             }
             Transition::Quit => break,
         }
@@ -202,12 +208,12 @@ pub async fn run_loop(app: App) -> Result<()> {
 pub struct StubMenuScreen;
 
 impl Screen for StubMenuScreen {
-    fn draw(&mut self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame, _ctx: &AppContext) {
         let p = Paragraph::new("Stub menu — TASK-tui-01 will replace this");
         frame.render_widget(p, frame.area());
     }
 
-    fn handle_event(&mut self, key: KeyEvent) -> Transition {
+    fn handle_event(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> Transition {
         use crossterm::event::KeyCode;
         match key.code {
             KeyCode::Char('q') => Transition::Quit,

@@ -15,10 +15,10 @@
 
 use anyhow::Result;
 
-use crate::presentation::handlers::tui::{run_loop, App, EntryMode, StubMenuScreen};
+use crate::presentation::handlers::tui::{menu::MenuScreen, run_loop, App, EntryMode};
 use crate::presentation::AppContext;
 
 pub async fn handle(ctx: AppContext) -> Result<()> {
-    let app = App::new(Box::new(StubMenuScreen), EntryMode::Menu, ctx);
+    let app = App::new(Box::new(MenuScreen::new()), EntryMode::Menu, ctx);
     run_loop(app).await
 }
