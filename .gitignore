@@ -1,0 +1,43 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Local SQLite caches (書架資料、章節快取、閱讀進度) — 不該上 repo
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# 環境變數 / 秘鑰
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# 使用者實際收的書源（包含可能侵權或私人來源）— 預設不公開
+# 想分享的書源放 examples/ 目錄
+/book-sources/*.json
+
+# IDE / 編輯器
+.vscode/
+.idea/
+*.swp
+*.swo
+.zed/
+
+# 系統
+.DS_Store
+Thumbs.db
+
+# 日誌
+*.log
+logs/
+
+# 暫存
+tmp/
+.cache/

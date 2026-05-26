@@ -1,0 +1,33 @@
+[package]
+name = "novel-looker"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# HTTP + HTML
+reqwest = { version = "0.12", features = ["gzip", "brotli", "rustls-tls"], default-features = false }
+scraper = "0.20"
+url = "2.5"
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+async-trait = "0.1"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI + TUI
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.28"
+crossterm = "0.28"
+
+# Error handling + utilities
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+once_cell = "1"
+regex = "1"
+dirs = "5"
+urlencoding = "2"

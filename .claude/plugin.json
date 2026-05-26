@@ -1,0 +1,10 @@
+{
+  "name": "novel-looker",
+  "version": "0.1.0",
+  "description": "終端機小說閱讀器 + 書源產生器。給網址，自動分析 DOM 結構，輸出 JSON 書源讓 CLI 抓取。",
+  "author": "TLOGBen",
+  "skills": [
+    ".claude/skills/parse-novel-site",
+    ".claude/skills/add-to-shelf"
+  ]
+}

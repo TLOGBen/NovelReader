@@ -1,0 +1,33 @@
+{
+  "bookSourceUrl": "https://www.gutenberg.org",
+  "bookSourceName": "Project Gutenberg",
+  "bookSourceGroup": "english/public-domain",
+  "enabled": true,
+  "bookUrlPattern": "https?://www\\.gutenberg\\.org/ebooks/\\d+",
+
+  "ruleSearch": {
+    "url": "https://www.gutenberg.org/ebooks/search/?query={{key}}",
+    "bookList": "li.booklink",
+    "name":     ".title@text",
+    "author":   ".subtitle@text",
+    "bookUrl":  "a.link@href"
+  },
+
+  "ruleBookInfo": {
+    "name":     "h1[itemprop='name'] || h1",
+    "author":   "a[itemprop='creator'] || a[rel='marcrel:aut']",
+    "intro":    "td[itemprop='description']",
+    "coverUrl": "img.cover-art@src",
+    "tocUrl":   "&"
+  },
+
+  "ruleToc": {
+    "chapterList": "table.files tr:has(a[type*='text/plain'])",
+    "chapterName": "td a@text",
+    "chapterUrl":  "td a[type*='text/plain']@href"
+  },
+
+  "ruleContent": {
+    "content": "body"
+  }
+}
