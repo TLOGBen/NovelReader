@@ -1,18 +1,17 @@
 //! TUI subcommand handler + main-menu shell (Screen trait routing).
 //!
 //! This module hosts two things:
-//!   1. The existing v1 `handle(novel_id, ctx)` entry point invoked by
-//!      `presentation::cli::run` for `novel-looker tui <id>`. It still
-//!      delegates to `presentation::reader::run` until TASK-tui-02
-//!      migrates the reader into a `ReaderScreen`.
-//!   2. The new TUI shell scaffolding: `Screen` trait, `Transition` enum,
+//!   1. The `handle(novel_id, ctx)` entry point invoked by
+//!      `presentation::cli::run` for `novel-looker tui <id>`. It constructs
+//!      a `ReaderScreen` with `EntryMode::DirectReader` and dispatches to
+//!      `run_loop` (REQ-006 — `m` 鍵在 DirectReader mode 退出 process)。
+//!   2. The TUI shell scaffolding: `Screen` trait, `Transition` enum,
 //!      `EntryMode` enum, `App` struct, `run_loop`, and the `RawTerm` RAII
-//!      guard. These are introduced empty (with a `StubMenuScreen`) and
-//!      will be wired up by subsequent TUI tasks.
+//!      guard. Wired up by TASK-tui-01 (MenuScreen) and TASK-tui-02
+//!      (ReaderScreen)。
 //!
-//! The shell items carry `#[allow(dead_code)]` until subsequent tasks
-//! reference them — the codebase precedent for this pattern is in
-//! `catalog/service/rule.rs::select_within` and `backup::facade::BackupReceipt`.
+//! `StubMenuScreen` 仍保留作為 fallback / 教學用，加 `#[allow(dead_code)]`
+//! —— 與 `catalog/service/rule.rs::select_within` 同樣的 dead-code pattern。
 
 use anyhow::Result;
 use crossterm::{
@@ -31,13 +30,22 @@ use std::time::Duration;
 use crate::presentation::AppContext;
 
 pub mod widgets;
+pub mod menu;
+pub mod reader;
+pub mod search;
+pub mod shelf;
+pub mod switch_source;
 
 // ============================================================================
-// v1 entry point (kept stable; cli.rs is "不動" until TASK-tui-02 migration).
+// CLI entry point for `novel-looker tui <id>` — DirectReader mode.
 // ============================================================================
+//
+// Takes `ctx` by value because `App` owns `AppContext` (run_loop / screens
+// access it via `&mut app.ctx`)。對應 cli.rs 的 dispatch arm 同樣 by-value。
 
-pub async fn handle(novel_id: i64, ctx: &mut AppContext) -> Result<()> {
-    crate::presentation::reader::run(&mut ctx.db, novel_id).await
+pub async fn handle(novel_id: i64, ctx: AppContext) -> Result<()> {
+    let app = App::new_with_direct_reader(ctx, novel_id).await?;
+    run_loop(app).await
 }
 
 // ============================================================================
@@ -75,10 +83,16 @@ pub enum Transition {
 /// `draw` 渲染當前畫面到 `Frame`；`handle_event` 收一個按鍵事件並回傳
 /// `Transition`。事件 polling、terminal 生命週期都由 `run_loop` 負責，
 /// screen 實作不需要碰。
+///
+/// `handle_event` 是 async 因為 reader screen 在切章節時需要 inline
+/// `await` fetch_chapter_content（與 v1 reader.rs 行為一致）。用
+/// `#[async_trait(?Send)]` 因為 `run_loop` 是單執行緒，不需要 Send bound
+/// 也避開 `Scraper` / `LibraryDb` 等型別未實作 `Send` 的限制。
 #[allow(dead_code)]
+#[async_trait::async_trait(?Send)]
 pub trait Screen {
-    fn draw(&mut self, frame: &mut Frame);
-    fn handle_event(&mut self, key: KeyEvent) -> Transition;
+    fn draw(&mut self, frame: &mut Frame, ctx: &AppContext);
+    async fn handle_event(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Transition;
 }
 
 /// TUI app state。
@@ -102,6 +116,26 @@ impl App {
     #[allow(dead_code)]
     pub fn new(current: Box<dyn Screen>, entry_mode: EntryMode, ctx: AppContext) -> Self {
         Self { current, entry_mode, ctx }
+    }
+
+    /// Convenience ctor — start with `MenuScreen`, `EntryMode::Menu`.
+    ///
+    /// 由 `presentation::handlers::menu::handle`（`novel-looker` 無子命令入口）
+    /// 呼叫，封裝「Box<MenuScreen> + EntryMode::Menu」這對固定組合。
+    pub fn new_with_menu(ctx: AppContext) -> Self {
+        Self::new(Box::new(menu::MenuScreen::new()), EntryMode::Menu, ctx)
+    }
+
+    /// Convenience ctor — start with `ReaderScreen`, `EntryMode::DirectReader`.
+    ///
+    /// 由 `presentation::handlers::tui::handle`（`novel-looker tui <id>` 入口）
+    /// 呼叫，封裝「pre-load ReaderScreen + EntryMode::DirectReader」流程；
+    /// `ReaderScreen::new` 借 `&mut ctx` 完成 inline await 後再把 ctx move
+    /// 進 `App`。
+    pub async fn new_with_direct_reader(mut ctx: AppContext, novel_id: i64) -> Result<Self> {
+        let reader =
+            reader::ReaderScreen::new(EntryMode::DirectReader, &mut ctx, novel_id).await?;
+        Ok(Self::new(Box::new(reader), EntryMode::DirectReader, ctx))
     }
 }
 
@@ -171,7 +205,12 @@ pub async fn run_loop(app: App) -> Result<()> {
     let mut app = app;
 
     loop {
-        term.terminal.draw(|f| app.current.draw(f))?;
+        // Split-borrow trick: take disjoint &mut references to `current` and
+        // `ctx` so we can pass `&ctx` into the draw closure (which would
+        // otherwise conflict with `&mut current`).
+        let App { current, ctx, .. } = &mut app;
+        let ctx_ref: &AppContext = ctx;
+        term.terminal.draw(|f| current.draw(f, ctx_ref))?;
 
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -181,10 +220,10 @@ pub async fn run_loop(app: App) -> Result<()> {
             continue;
         }
 
-        match app.current.handle_event(key) {
+        match current.handle_event(key, ctx).await {
             Transition::Stay => {}
             Transition::To(next) => {
-                app.current = next;
+                *current = next;
             }
             Transition::Quit => break,
         }
@@ -201,13 +240,14 @@ pub async fn run_loop(app: App) -> Result<()> {
 #[allow(dead_code)]
 pub struct StubMenuScreen;
 
+#[async_trait::async_trait(?Send)]
 impl Screen for StubMenuScreen {
-    fn draw(&mut self, frame: &mut Frame) {
+    fn draw(&mut self, frame: &mut Frame, _ctx: &AppContext) {
         let p = Paragraph::new("Stub menu — TASK-tui-01 will replace this");
         frame.render_widget(p, frame.area());
     }
 
-    fn handle_event(&mut self, key: KeyEvent) -> Transition {
+    async fn handle_event(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> Transition {
         use crossterm::event::KeyCode;
         match key.code {
             KeyCode::Char('q') => Transition::Quit,
