@@ -101,12 +101,9 @@ impl Screen for MenuScreen {
                 Transition::Stay
             }
             KeyCode::Enter => match self.selected {
-                0 => {
-                    // tui-03 ShelfScreen 接上之前的 placeholder.
-                    self.settings_stub_msg =
-                        Some("（書架等 tui-03 實裝；目前用 `novel-looker shelf` CLI）");
-                    Transition::Stay
-                }
+                0 => Transition::To(Box::new(
+                    crate::presentation::handlers::tui::shelf::ShelfScreen::new(),
+                )),
                 1 => {
                     self.settings_stub_msg = Some("（搜尋等 tui-04 實裝）");
                     Transition::Stay
@@ -201,13 +198,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn enter_on_shelf_shows_placeholder() {
+    async fn enter_on_shelf_transitions_to_shelf_screen() {
+        // tui-03: Enter on 書架 should now transition to ShelfScreen
+        // (replacing the earlier tui-03 stub-msg placeholder behaviour).
         let mut m = MenuScreen::new();
         let mut ctx = test_ctx();
         m.selected = 0;
         let t = m.handle_event(press(KeyCode::Enter), &mut ctx).await;
-        assert!(matches!(t, Transition::Stay));
-        assert!(m.settings_stub_msg.is_some());
+        assert!(matches!(t, Transition::To(_)));
     }
 
     #[tokio::test]

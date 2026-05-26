@@ -32,6 +32,7 @@ use crate::presentation::AppContext;
 pub mod widgets;
 pub mod menu;
 pub mod reader;
+pub mod shelf;
 
 // ============================================================================
 // CLI entry point for `novel-looker tui <id>` — DirectReader mode.
