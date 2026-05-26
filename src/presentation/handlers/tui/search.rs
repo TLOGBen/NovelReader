@@ -207,6 +207,61 @@ impl Screen for SearchScreen {
 // Search funnel core
 // ----------------------------------------------------------------------------
 
+/// 單源序列查的「分類後結果」—— `do_search` 的 for-loop 對每個源產出一個
+/// `SourceOutcome`，再由 pure helper `assemble_rows` 統一格式化為
+/// `Vec<HitOrStatus>` 給 UI。把 IO/timing 與訊息組裝拆開、後者可單測。
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum SourceOutcome {
+    /// scraper.search 成功；可能 0 或多筆 hit。
+    Hits(Vec<SearchHit>),
+    /// scraper.search 回 Err — 帶上格式化後的錯誤訊息（不含源名前綴）。
+    ScrapeErr(String),
+    /// 單源 timeout（per_source budget 用盡）。
+    Timeout,
+    /// 該源 turn 之前全局 deadline 已過、本源未被詢問。
+    NotQueried,
+}
+
+/// Pure helper：把（源名、SourceOutcome）序列攤平為 UI 要顯示的行序列。
+///
+/// 規則（鏡射 REQ-003 Scenarios）：
+/// - `Hits(vec)` → 每筆 hit 一個 `HitOrStatus::Hit { hit, source_name }`。
+/// - `ScrapeErr(msg)` → 一行 `源 X：錯誤 <msg>`（紅）。
+/// - `Timeout` → 一行 `源 X：逾時`（紅）。
+/// - `NotQueried` → 一行 `源 X 未查（時間預算用盡）`（紅）。
+///
+/// 此 fn 不碰 scraper / db / 時鐘；純函數，由 unit test 驗證 funnel 訊息
+/// 分流（REQ-003 Scenarios 1-3）。
+pub fn assemble_rows(per_source: Vec<(String, SourceOutcome)>) -> Vec<HitOrStatus> {
+    let mut rows: Vec<HitOrStatus> = Vec::new();
+    for (name, outcome) in per_source {
+        match outcome {
+            SourceOutcome::Hits(hits) => {
+                for hit in hits {
+                    rows.push(HitOrStatus::Hit {
+                        hit,
+                        source_name: name.clone(),
+                    });
+                }
+            }
+            SourceOutcome::ScrapeErr(msg) => {
+                rows.push(HitOrStatus::StatusLine(format!("源 {}：錯誤 {}", name, msg)));
+            }
+            SourceOutcome::Timeout => {
+                rows.push(HitOrStatus::StatusLine(format!("源 {}：逾時", name)));
+            }
+            SourceOutcome::NotQueried => {
+                rows.push(HitOrStatus::StatusLine(format!(
+                    "源 {} 未查（時間預算用盡）",
+                    name
+                )));
+            }
+        }
+    }
+    rows
+}
+
 /// 逐源序列查 — 全局 15s deadline + 單源 timeout（per_source = remaining /
 /// remaining_count，下限 2s）。單源錯誤 / timeout 不中斷整體 funnel。
 async fn do_search(ctx: &mut AppContext, keyword: &str) -> Vec<HitOrStatus> {
@@ -225,47 +280,28 @@ async fn do_search(ctx: &mut AppContext, keyword: &str) -> Vec<HitOrStatus> {
         )];
     }
 
-    let mut rows: Vec<HitOrStatus> = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(15);
     let total = sources.len();
+    let mut per_source: Vec<(String, SourceOutcome)> = Vec::with_capacity(total);
 
     for (i, src) in sources.iter().enumerate() {
         let now = Instant::now();
         if now >= deadline {
-            rows.push(HitOrStatus::StatusLine(format!(
-                "源 {} 未查（時間預算用盡）",
-                src.book_source_name
-            )));
+            per_source.push((src.book_source_name.clone(), SourceOutcome::NotQueried));
             continue;
         }
         let remaining = deadline.saturating_duration_since(now);
         let remaining_count = (total - i) as u32;
-        let per_source = (remaining / remaining_count.max(1)).max(Duration::from_secs(2));
+        let budget = (remaining / remaining_count.max(1)).max(Duration::from_secs(2));
 
-        match tokio::time::timeout(per_source, ctx.scraper.search(src, keyword)).await {
-            Ok(Ok(hits)) => {
-                for hit in hits {
-                    rows.push(HitOrStatus::Hit {
-                        hit,
-                        source_name: src.book_source_name.clone(),
-                    });
-                }
-            }
-            Ok(Err(e)) => {
-                rows.push(HitOrStatus::StatusLine(format!(
-                    "源 {}：錯誤 {:#}",
-                    src.book_source_name, e
-                )));
-            }
-            Err(_elapsed) => {
-                rows.push(HitOrStatus::StatusLine(format!(
-                    "源 {}：逾時",
-                    src.book_source_name
-                )));
-            }
-        }
+        let outcome = match tokio::time::timeout(budget, ctx.scraper.search(src, keyword)).await {
+            Ok(Ok(hits)) => SourceOutcome::Hits(hits),
+            Ok(Err(e)) => SourceOutcome::ScrapeErr(format!("{:#}", e)),
+            Err(_elapsed) => SourceOutcome::Timeout,
+        };
+        per_source.push((src.book_source_name.clone(), outcome));
     }
-    rows
+    assemble_rows(per_source)
 }
 
 // ----------------------------------------------------------------------------
@@ -354,11 +390,187 @@ fn shelf_position(ctx: &AppContext, novel_id: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crossterm::event::{KeyEvent, KeyModifiers};
+
+    // ------------------------------------------------------------------
+    // Existing smoke test
+    // ------------------------------------------------------------------
 
     #[test]
     fn new_starts_in_input_state_with_no_progress() {
         let s = SearchScreen::new();
         assert!(matches!(s.state, SearchState::Input(_)));
         assert!(s.progress.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-003 funnel pure helper tests (assemble_rows)
+    //
+    // 不需 tokio runtime / 不碰 scraper / 不碰 db — 純函數驗證 funnel
+    // 訊息分流（Scenarios 1-3）。
+    // ------------------------------------------------------------------
+
+    fn make_hit(name: &str, src_url: &str) -> SearchHit {
+        SearchHit {
+            source_url: src_url.into(),
+            name: name.into(),
+            author: Some("作者".into()),
+            book_url: format!("https://example.com/{}", name),
+            kind: None,
+            intro: None,
+        }
+    }
+
+    /// Scenario 1: 多源序列查完無 timeout → 三源各自命中，無狀態列。
+    #[test]
+    fn req003_scenario1_three_sources_all_hit() {
+        let per_source = vec![
+            (
+                "源 A".to_string(),
+                SourceOutcome::Hits(vec![make_hit("超維術士", "http://a")]),
+            ),
+            (
+                "源 B".to_string(),
+                SourceOutcome::Hits(vec![make_hit("超維術士", "http://b")]),
+            ),
+            (
+                "源 C".to_string(),
+                SourceOutcome::Hits(vec![make_hit("超維術士", "http://c")]),
+            ),
+        ];
+        let rows = assemble_rows(per_source);
+        assert_eq!(rows.len(), 3, "三源各一筆 hit、共三行");
+        // 順序與來源名稱對應、且全是 Hit、無 StatusLine。
+        for (i, expected_src) in ["源 A", "源 B", "源 C"].iter().enumerate() {
+            match &rows[i] {
+                HitOrStatus::Hit { source_name, .. } => {
+                    assert_eq!(source_name, expected_src);
+                }
+                HitOrStatus::StatusLine(s) => panic!("row {} 應為 Hit，得 StatusLine: {}", i, s),
+            }
+        }
+    }
+
+    /// Scenario 2: 全局 deadline 截斷 → 已查 A/B/C 命中、D 逾時、E 未查。
+    #[test]
+    fn req003_scenario2_deadline_truncates_remaining_sources() {
+        let per_source = vec![
+            ("源 A".to_string(), SourceOutcome::Hits(vec![make_hit("X", "http://a")])),
+            ("源 B".to_string(), SourceOutcome::Hits(vec![make_hit("X", "http://b")])),
+            ("源 C".to_string(), SourceOutcome::Hits(vec![make_hit("X", "http://c")])),
+            ("源 D".to_string(), SourceOutcome::Timeout),
+            ("源 E".to_string(), SourceOutcome::NotQueried),
+        ];
+        let rows = assemble_rows(per_source);
+        assert_eq!(rows.len(), 5);
+
+        // 前三行為 Hit
+        for i in 0..3 {
+            assert!(matches!(rows[i], HitOrStatus::Hit { .. }), "row {} 應為 Hit", i);
+        }
+        // D 為逾時警示
+        match &rows[3] {
+            HitOrStatus::StatusLine(s) => {
+                assert!(s.contains("源 D"), "expect 源 D 出現於訊息: {}", s);
+                assert!(s.contains("逾時"), "expect '逾時' 字樣: {}", s);
+            }
+            _ => panic!("row 3 應為 StatusLine"),
+        }
+        // E 為未查警示（時間預算用盡）
+        match &rows[4] {
+            HitOrStatus::StatusLine(s) => {
+                assert!(s.contains("源 E"), "expect 源 E 出現於訊息: {}", s);
+                assert!(s.contains("未查"), "expect '未查' 字樣: {}", s);
+            }
+            _ => panic!("row 4 應為 StatusLine"),
+        }
+    }
+
+    /// Scenario 3: 單源錯誤不影響其他源 → A hit、B 錯誤、C 仍 hit。
+    #[test]
+    fn req003_scenario3_single_source_error_does_not_block_others() {
+        let per_source = vec![
+            ("源 A".to_string(), SourceOutcome::Hits(vec![make_hit("X", "http://a")])),
+            ("源 B".to_string(), SourceOutcome::ScrapeErr("規則寫錯".into())),
+            ("源 C".to_string(), SourceOutcome::Hits(vec![make_hit("X", "http://c")])),
+        ];
+        let rows = assemble_rows(per_source);
+        assert_eq!(rows.len(), 3);
+        assert!(matches!(rows[0], HitOrStatus::Hit { .. }));
+        match &rows[1] {
+            HitOrStatus::StatusLine(s) => {
+                assert!(s.contains("源 B"), "源 B 應出現: {}", s);
+                assert!(s.contains("錯誤"), "應含錯誤字樣: {}", s);
+                assert!(s.contains("規則寫錯"), "應帶錯誤明細: {}", s);
+            }
+            _ => panic!("row 1 應為 StatusLine"),
+        }
+        assert!(matches!(rows[2], HitOrStatus::Hit { .. }));
+    }
+
+    /// 邊界：空輸入 → 空輸出。
+    #[test]
+    fn req003_assemble_rows_empty_input() {
+        let rows = assemble_rows(vec![]);
+        assert!(rows.is_empty());
+    }
+
+    /// 邊界：Hits 為空向量（源回應成功但無命中）→ 不輸出該源任何行。
+    #[test]
+    fn req003_assemble_rows_zero_hits_emits_nothing_for_that_source() {
+        let per_source = vec![
+            ("源 A".to_string(), SourceOutcome::Hits(vec![])),
+            ("源 B".to_string(), SourceOutcome::Hits(vec![make_hit("X", "http://b")])),
+        ];
+        let rows = assemble_rows(per_source);
+        assert_eq!(rows.len(), 1, "源 A 0 hits → 不產生行；源 B 1 hit → 1 行");
+        assert!(matches!(rows[0], HitOrStatus::Hit { .. }));
+    }
+
+    // ------------------------------------------------------------------
+    // REQ-003 Scenarios 4-5: Esc 在 Input / Results mode 都回 MenuScreen
+    // ------------------------------------------------------------------
+
+    fn test_ctx() -> AppContext {
+        let db = crate::library::dao::LibraryDb::open_in_memory().expect("open in-memory db");
+        let scraper = crate::catalog::service::scraper::Scraper::new().expect("scraper init");
+        let config = Config::default();
+        AppContext { db, scraper, config }
+    }
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Scenario 4: Input mode 按 Esc → Transition::To(MenuScreen)。
+    #[tokio::test]
+    async fn req003_scenario4_esc_in_input_mode_transitions_to_menu() {
+        let mut s = SearchScreen::new();
+        let mut ctx = test_ctx();
+        // 起始狀態應為 Input。
+        assert!(matches!(s.state, SearchState::Input(_)));
+        let t = s.handle_event(press(KeyCode::Esc), &mut ctx).await;
+        assert!(
+            matches!(t, Transition::To(_)),
+            "Input mode Esc 應 transition 到下一個 screen (MenuScreen)"
+        );
+    }
+
+    /// Scenario 5: Results mode 按 Esc → Transition::To(MenuScreen)。
+    #[tokio::test]
+    async fn req003_scenario5_esc_in_results_mode_transitions_to_menu() {
+        let mut s = SearchScreen::new();
+        let mut ctx = test_ctx();
+        // 直接把 state 切到 Results（不跑真 do_search，避免動到 scraper）。
+        s.state = SearchState::Results {
+            rows: vec![HitOrStatus::StatusLine("dummy".into())],
+            list_state: ListState::default(),
+        };
+        let t = s.handle_event(press(KeyCode::Esc), &mut ctx).await;
+        assert!(
+            matches!(t, Transition::To(_)),
+            "Results mode Esc 應 transition 到下一個 screen (MenuScreen)"
+        );
     }
 }
