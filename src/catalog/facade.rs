@@ -10,7 +10,9 @@
 //! (fetch_novel_info + add_novel) and `read` cache-miss (fetch_chapter_content +
 //! save_chapter_content).
 
-use anyhow::Result;
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
 
 use crate::catalog::dao;
 use crate::catalog::service::scraper::Scraper;
@@ -61,6 +63,26 @@ pub async fn sync_toc(
     let n = chapters.len();
     dao::replace_toc(db, novel_id, &chapters)?;
     Ok(n)
+}
+
+/// Switch-source TOC fetch with a hard overall deadline. Wraps `Scraper::fetch_toc`
+/// in `tokio::time::timeout`. Used by the switch-source handler so a hung TOC page
+/// can't stall the whole transaction; the existing `sync_toc` path is unchanged.
+///
+/// - `Ok(Ok(chapters))` → `Ok(chapters)`
+/// - `Ok(Err(e))`       → propagate the scraper error
+/// - `Err(_elapsed)`    → `Err(anyhow!("fetch_toc timeout after {:?}", deadline))`
+pub async fn fetch_toc_with_timeout(
+    scraper: &Scraper,
+    src: &BookSource,
+    toc_url: &str,
+    deadline: Duration,
+) -> Result<Vec<ChapterMeta>> {
+    match tokio::time::timeout(deadline, scraper.fetch_toc(src, toc_url)).await {
+        Ok(Ok(chapters)) => Ok(chapters),
+        Ok(Err(e)) => Err(e),
+        Err(_elapsed) => Err(anyhow!("fetch_toc timeout after {:?}", deadline)),
+    }
 }
 
 /// `read` / `tui` use case (cache miss path) — fetch chapter content. Handler
