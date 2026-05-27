@@ -29,12 +29,19 @@ use std::time::Duration;
 
 use crate::presentation::AppContext;
 
+/// Default TTL for toasts displayed on transient screens (delete-success,
+/// switch-source-success, search-add-success). 3s 是 /think 2026-05-27 KD #4
+/// 取的折衷 — 200ms event-poll tick 容忍下實際延遲約 3.2s。共用於
+/// [`MenuScreen`] 與 [`ShelfScreen`]，避免 sibling 反向依賴。
+pub(crate) const TOAST_TTL: Duration = Duration::from_secs(3);
+
 pub mod widgets;
 pub mod menu;
 pub mod reader;
 pub mod search;
 pub mod shelf;
 pub mod switch_source;
+pub mod delete_confirm;
 
 // ============================================================================
 // CLI entry point for `novel-looker tui <id>` — DirectReader mode.
