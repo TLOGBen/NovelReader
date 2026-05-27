@@ -22,7 +22,7 @@
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Style},
@@ -138,7 +138,12 @@ impl Screen for SearchScreen {
         }
     }
 
-    async fn handle_event(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Transition {
+    async fn handle_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {
+        let key: KeyEvent = match event {
+            Event::Key(k) => k,
+            Event::Mouse(_) => return Transition::Stay,
+            _ => return Transition::Stay,
+        };
         // 任意鍵清 progress（舊狀態訊息不殘留）
         self.progress = None;
 
@@ -391,7 +396,7 @@ fn shelf_position(ctx: &AppContext, novel_id: i64) -> usize {
 mod tests {
     use super::*;
     use crate::config::Config;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyEvent, KeyModifiers};
 
     // ------------------------------------------------------------------
     // Existing smoke test
@@ -539,8 +544,9 @@ mod tests {
         AppContext { db, scraper, config }
     }
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::empty())
+    /// Trait migration: 既有 UT 改為包 Event::Key(...)，行為斷言不變。
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
     }
 
     /// Scenario 4: Input mode 按 Esc → Transition::To(MenuScreen)。

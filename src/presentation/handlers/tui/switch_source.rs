@@ -16,7 +16,7 @@
 //! 任一觸發時不呼叫 `library::facade::switch_source_tx`）。
 
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Style},
@@ -131,7 +131,12 @@ impl Screen for SwitchSourceScreen {
         frame.render_widget(hint, rows[2]);
     }
 
-    async fn handle_event(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Transition {
+    async fn handle_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {
+        let key: KeyEvent = match event {
+            Event::Key(k) => k,
+            Event::Mouse(_) => return Transition::Stay,
+            _ => return Transition::Stay,
+        };
         match key.code {
             KeyCode::Tab => {
                 self.focus = if self.focus == Focus::BookUrl {
