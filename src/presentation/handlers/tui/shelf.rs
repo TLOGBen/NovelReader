@@ -23,12 +23,97 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use std::sync::Arc;
 use std::time::Instant;
 
+use crate::catalog;
 use crate::library;
 use crate::library::Novel;
+use crate::presentation::handlers::tui::picker::{PickerEntry, SearchPickerScreen};
 use crate::presentation::handlers::tui::{EntryMode, Screen, Transition, TOAST_TTL};
 use crate::presentation::AppContext;
+
+// ---------------------------------------------------------------------------
+// Shelf 's' caller-side guard — REQ-005 entry into SearchPickerScreen.
+//
+// `classify_s_press` is a pure helper that inspects shelf state + DB to
+// decide what should happen on 's'. The `handle_event` arm consumes the
+// classification and builds the actual `Transition` (which needs `&mut ctx`
+// for `Scraper::new()` and `spawn_searches`).
+// ---------------------------------------------------------------------------
+
+/// Outcome of pressing 's' on the shelf.
+///
+/// Pure data — `handle_event` is responsible for translating each variant
+/// into a `Transition` (open picker / stay / toast back to shelf).
+#[derive(Debug)]
+pub(crate) enum ShelfSAction {
+    /// No selection (empty shelf / `list_state.selected() == None`) or the
+    /// highlighted row is missing an id — caller stays put.
+    Stay,
+    /// Anchor resolved (progress + chapter row both exist) — caller builds
+    /// `SearchPickerScreen` with these inputs.
+    OpenPicker {
+        novel_id: i64,
+        book_name: String,
+        author: String,
+        old_chapter_idx: i64,
+        old_chapter_name: String,
+    },
+    /// Anchor lookup failed (no progress row → treated as idx 0 with no
+    /// matching chapter row, OR progress idx out of range of `chapters`
+    /// table). Caller stays on shelf and surfaces a toast.
+    ToastBackToShelf { toast: String },
+}
+
+/// Pure classifier — decide what 's' should do given current shelf state.
+///
+/// Reads `library::facade::get_progress` + `library::facade::get_chapter`
+/// to resolve the fuzzy anchor (chapter name) that the picker needs for
+/// `picker-02`'s sync step. Any miss → `ToastBackToShelf` (REQ-002 S5).
+pub(crate) fn classify_s_press(
+    ctx: &AppContext,
+    list_state: &ListState,
+    novels: &[Novel],
+) -> ShelfSAction {
+    let Some(idx) = list_state.selected() else {
+        return ShelfSAction::Stay;
+    };
+    let Some(novel) = novels.get(idx) else {
+        return ShelfSAction::Stay;
+    };
+    let Some(novel_id) = novel.id else {
+        return ShelfSAction::Stay;
+    };
+
+    // Anchor lookup: progress.chapter_index defaults to 0 if no progress row.
+    let chapter_idx = library::facade::get_progress(&ctx.db, novel_id)
+        .ok()
+        .flatten()
+        .map(|p| p.chapter_index)
+        .unwrap_or(0);
+
+    // chapter row must exist (REQ-002 S5) — we only need the *name* (anchor
+    // for fuzzy match), not the cached content. `library::facade::get_chapter`
+    // returns None when `content IS NULL` even if the meta row exists, so
+    // use `list_chapters` + find-by-idx to get a name-only lookup.
+    let chapter_name = library::facade::list_chapters(&ctx.db, novel_id)
+        .ok()
+        .and_then(|all| all.into_iter().find(|c| c.index == chapter_idx).map(|c| c.name));
+
+    match chapter_name {
+        Some(name) => ShelfSAction::OpenPicker {
+            novel_id,
+            book_name: novel.name.clone(),
+            author: novel.author.clone().unwrap_or_default(),
+            old_chapter_idx: chapter_idx,
+            old_chapter_name: name,
+        },
+        None => ShelfSAction::ToastBackToShelf {
+            toast: "找不到舊章節，無法換源".to_string(),
+        },
+    }
+}
 
 #[allow(dead_code)]
 pub struct ShelfScreen {
@@ -232,18 +317,57 @@ impl Screen for ShelfScreen {
                 Transition::Stay
             }
             KeyCode::Char('s') => {
-                // 取當前 highlight 的 novel，transition 到 SwitchSourceScreen。
-                // 沒選 / 缺 id → Stay（與 Enter 同樣的防呆 pattern）。
-                if let Some(i) = self.list_state.selected() {
-                    if let Some(novel) = self.novels.get(i) {
-                        if let Some(novel_id) = novel.id {
-                            return Transition::To(Box::new(
-                                crate::presentation::handlers::tui::switch_source::SwitchSourceScreen::new(novel_id),
-                            ));
-                        }
+                // REQ-005 entry: build SearchPickerScreen with PickerEntry::Shelf.
+                // Pure helper classifies the press; we translate to Transition.
+                match classify_s_press(ctx, &self.list_state, &self.novels) {
+                    ShelfSAction::Stay => Transition::Stay,
+                    ShelfSAction::ToastBackToShelf { toast } => Transition::To(Box::new(
+                        ShelfScreen::with_highlight_until(
+                            None,
+                            Some(toast),
+                            Instant::now() + TOAST_TTL,
+                        ),
+                    )),
+                    ShelfSAction::OpenPicker {
+                        novel_id,
+                        book_name,
+                        author,
+                        old_chapter_idx,
+                        old_chapter_name,
+                    } => {
+                        let mut picker = SearchPickerScreen::new(
+                            PickerEntry::Shelf,
+                            novel_id,
+                            book_name,
+                            author,
+                            old_chapter_idx,
+                            old_chapter_name,
+                        );
+                        // Build a dedicated Scraper for the parallel JoinSet —
+                        // ctx.scraper is owned (no Clone derive) so we mint a
+                        // fresh one and Arc-wrap it for `spawn_searches`. wreq
+                        // emulation init is the cost; acceptable per-press.
+                        let scraper = match catalog::service::scraper::Scraper::new() {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                return Transition::To(Box::new(
+                                    ShelfScreen::with_highlight_until(
+                                        None,
+                                        Some(format!("無法初始化 scraper：{:#}", e)),
+                                        Instant::now() + TOAST_TTL,
+                                    ),
+                                ));
+                            }
+                        };
+                        let enabled_sources: Vec<_> = catalog::facade::list_sources(&ctx.db)
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|s| s.enabled)
+                            .collect();
+                        picker.spawn_searches(scraper, enabled_sources);
+                        Transition::To(Box::new(picker))
                     }
                 }
-                Transition::Stay
             }
             KeyCode::Char('d') => {
                 // 取當前 highlight 的 novel，transition 到 DeleteConfirmScreen。
@@ -380,6 +504,139 @@ mod tests {
         let shelf = ShelfScreen::new();
         assert!(shelf.toast.is_none());
         assert!(shelf.initial_highlight_book_url.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // INT-entry-shelf-build-01 / INT-entry-shelf-empty-04 /
+    // INT-entry-shelf-chapter-not-found-05 — REQ-005 's' wire to
+    // SearchPickerScreen with PickerEntry::Shelf + caller-side guards.
+    // ------------------------------------------------------------------
+
+    use crate::library::{ChapterMeta as CMeta, ReadProgress};
+
+    /// Seed a richer fixture: 1 novel + 1 source row + N chapters +
+    /// optional progress. Returns (ctx, novel_id).
+    fn seed_shelf_with_progress(
+        novel_name: &str,
+        author: &str,
+        chapters: Vec<CMeta>,
+        progress_idx: Option<i64>,
+    ) -> (AppContext, i64) {
+        let mut db = LibraryDb::open_in_memory().expect("open in-memory db");
+        let novel = Novel {
+            id: None,
+            source_url: "https://src.example/".into(),
+            book_url: "https://book.example/build01".into(),
+            name: novel_name.into(),
+            author: Some(author.into()),
+            intro: None,
+            cover_url: None,
+            toc_url: None,
+        };
+        let id = db.upsert_novel(&novel).expect("upsert");
+        if !chapters.is_empty() {
+            crate::catalog::dao::replace_toc(&mut db, id, &chapters)
+                .expect("replace_toc");
+        }
+        if let Some(pi) = progress_idx {
+            db.save_progress(&ReadProgress {
+                novel_id: id,
+                chapter_index: pi,
+                scroll_offset: 0,
+            })
+            .expect("save progress");
+        }
+        let scraper =
+            crate::catalog::service::scraper::Scraper::new().expect("scraper init");
+        let ctx = AppContext { db, scraper, config: Config::default() };
+        (ctx, id)
+    }
+
+    // INT-entry-shelf-build-01:
+    // shelf has highlight + progress.chapter_index → chapters[idx] exists →
+    // classify_s_press returns OpenPicker with anchor fields.
+    #[tokio::test]
+    async fn int_entry_shelf_build_01() {
+        let chapters = vec![
+            CMeta { index: 0, name: "第一章".into(), url: "u/0".into() },
+            CMeta { index: 1, name: "第二章".into(), url: "u/1".into() },
+            CMeta { index: 2, name: "出關".into(), url: "u/2".into() },
+            CMeta { index: 3, name: "第四章".into(), url: "u/3".into() },
+        ];
+        let (ctx, id) = seed_shelf_with_progress("天龍八部", "金庸", chapters, Some(2));
+        let mut shelf = ShelfScreen::new();
+        shelf.refresh(&ctx).expect("refresh");
+        assert_eq!(shelf.list_state.selected(), Some(0));
+
+        let action = super::classify_s_press(&ctx, &shelf.list_state, &shelf.novels);
+        match action {
+            super::ShelfSAction::OpenPicker {
+                novel_id,
+                book_name,
+                author,
+                old_chapter_idx,
+                old_chapter_name,
+            } => {
+                assert_eq!(novel_id, id);
+                assert_eq!(book_name, "天龍八部");
+                assert_eq!(author, "金庸");
+                assert_eq!(old_chapter_idx, 2);
+                assert_eq!(old_chapter_name, "出關");
+            }
+            other => panic!("應為 OpenPicker，實際 = {:?}", other),
+        }
+    }
+
+    // INT-entry-shelf-empty-04: empty shelf → press 's' → Transition::Stay.
+    #[tokio::test]
+    async fn int_entry_shelf_empty_04() {
+        let db = LibraryDb::open_in_memory().expect("open in-memory db");
+        let scraper =
+            crate::catalog::service::scraper::Scraper::new().expect("scraper init");
+        let mut ctx = AppContext { db, scraper, config: Config::default() };
+        let mut shelf = ShelfScreen::new();
+        shelf.refresh(&ctx).expect("refresh");
+        assert!(shelf.novels.is_empty());
+        assert_eq!(shelf.list_state.selected(), None);
+
+        let t = shelf.handle_event(press(KeyCode::Char('s')), &mut ctx).await;
+        assert!(matches!(t, Transition::Stay), "空 shelf 's' 應 Stay");
+    }
+
+    // INT-entry-shelf-chapter-not-found-05:
+    // progress.chapter_index 對應 chapter row 不存在 → classify_s_press
+    // returns ToastBackToShelf with 「找不到舊章節」.
+    #[tokio::test]
+    async fn int_entry_shelf_chapter_not_found_05() {
+        let chapters = vec![
+            CMeta { index: 0, name: "第一章".into(), url: "u/0".into() },
+            CMeta { index: 1, name: "第二章".into(), url: "u/1".into() },
+            CMeta { index: 2, name: "第三章".into(), url: "u/2".into() },
+        ];
+        // progress.chapter_index=99 — chapters table has no idx=99 row
+        let (mut ctx, _id) =
+            seed_shelf_with_progress("壞資料書", "無名", chapters, Some(99));
+        let mut shelf = ShelfScreen::new();
+        shelf.refresh(&ctx).expect("refresh");
+
+        let action = super::classify_s_press(&ctx, &shelf.list_state, &shelf.novels);
+        match action {
+            super::ShelfSAction::ToastBackToShelf { toast } => {
+                assert!(
+                    toast.contains("找不到舊章節"),
+                    "toast 應含「找不到舊章節」，實際 = {}",
+                    toast
+                );
+            }
+            other => panic!("應為 ToastBackToShelf，實際 = {:?}", other),
+        }
+
+        // 並驗 handle_event 也走 Transition::To（不開 picker、留 shelf）
+        let t = shelf.handle_event(press(KeyCode::Char('s')), &mut ctx).await;
+        assert!(
+            matches!(t, Transition::To(_)),
+            "chapter-not-found 's' 應 Transition::To（帶 toast 的 shelf）"
+        );
     }
 
     // ------------------------------------------------------------------

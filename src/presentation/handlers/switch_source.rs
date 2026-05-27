@@ -22,7 +22,9 @@ pub async fn handle(
     source: String,
     ctx: &mut AppContext,
 ) -> Result<()> {
-    match switch_source_core::run(ctx, novel_id, &source, &new_book_url).await {
+    // TASK-handler-core-01: CLI 路徑永遠傳 `target_idx: None` —
+    // facade fall back 第一章 idx，保持本次擴前等價行為。
+    match switch_source_core::run(ctx, novel_id, &source, &new_book_url, None).await {
         Ok(outcome) => {
             // `new_progress_idx` 是 0-based DB 內部欄位；訊息給人類看以 1-based。
             println!(

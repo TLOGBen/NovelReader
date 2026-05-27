@@ -40,8 +40,8 @@ pub mod menu;
 pub mod reader;
 pub mod search;
 pub mod shelf;
-pub mod switch_source;
 pub mod delete_confirm;
+pub mod picker;
 
 // ============================================================================
 // CLI entry point for `novel-looker tui <id>` — DirectReader mode.
