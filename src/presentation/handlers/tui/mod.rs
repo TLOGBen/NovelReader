@@ -15,7 +15,7 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEvent, KeyEventKind},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -99,7 +99,52 @@ pub enum Transition {
 #[async_trait::async_trait(?Send)]
 pub trait Screen {
     fn draw(&mut self, frame: &mut Frame, ctx: &AppContext);
-    async fn handle_event(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Transition;
+    async fn handle_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition;
+}
+
+/// Test seam — abstract event source for `run_inner`.
+///
+/// Production impl ([`CrosstermEventSource`]) wraps `crossterm::event::poll` /
+/// `event::read`. Tests provide a `Vec<Event>`-backed mock so we can drive
+/// `run_inner` deterministically (INT-trait-04 / INT-trait-05).
+#[allow(dead_code)]
+pub(crate) trait EventSource {
+    fn poll(&mut self, dur: Duration) -> Result<bool>;
+    fn read(&mut self) -> Result<Event>;
+}
+
+/// Production [`EventSource`] — thin wrapper around crossterm's polling API.
+#[allow(dead_code)]
+pub(crate) struct CrosstermEventSource;
+
+impl EventSource for CrosstermEventSource {
+    fn poll(&mut self, dur: Duration) -> Result<bool> {
+        Ok(event::poll(dur)?)
+    }
+    fn read(&mut self) -> Result<Event> {
+        Ok(event::read()?)
+    }
+}
+
+/// Test seam — abstract terminal-like draw target for `run_inner`.
+///
+/// Production uses [`ratatui::Terminal`]; tests can provide a no-op impl
+/// that swallows `draw_frame` (INT-trait-04 / INT-trait-05 don't assert on
+/// rendered output, only on event forwarding).
+#[allow(dead_code)]
+pub(crate) trait TerminalLike {
+    /// Invoke `f` with a [`Frame`]; the production impl borrows the
+    /// internal `Terminal` and forwards to `Terminal::draw`. Test impls
+    /// may skip drawing entirely (return Ok(())) since UT for `run_inner`
+    /// only cares about event dispatch.
+    fn draw_frame(&mut self, f: &mut dyn FnMut(&mut Frame)) -> Result<()>;
+}
+
+impl TerminalLike for RawTerm {
+    fn draw_frame(&mut self, f: &mut dyn FnMut(&mut Frame)) -> Result<()> {
+        self.terminal.draw(|frame| f(frame))?;
+        Ok(())
+    }
 }
 
 /// TUI app state。
@@ -209,6 +254,26 @@ fn install_panic_hook() {
 pub async fn run_loop(app: App) -> Result<()> {
     install_panic_hook();
     let mut term = RawTerm::enter()?;
+    let mut events = CrosstermEventSource;
+    run_inner(app, &mut events, &mut term).await
+}
+
+/// Testable seam — the real event loop. Same behaviour as the previous
+/// monolithic `run_loop`, but `events` and `term` are injected so tests can
+/// feed canned events (INT-trait-04 / INT-trait-05).
+///
+/// Behaviour:
+/// - `Event::Key` with `kind == KeyEventKind::Press` → forward to screen.
+/// - Other `Event::Key` kinds (Release / Repeat) → ignore (`continue`).
+/// - `Event::Mouse(_)` → forward to screen (REQ-001 S2; previously dropped).
+/// - All other event types (Resize / Paste / FocusGained / FocusLost) →
+///   `continue` (run_loop does not forward; REQ-001 S2 final clause).
+#[allow(dead_code)]
+pub(crate) async fn run_inner<E: EventSource, T: TerminalLike>(
+    app: App,
+    events: &mut E,
+    term: &mut T,
+) -> Result<()> {
     let mut app = app;
 
     loop {
@@ -217,17 +282,27 @@ pub async fn run_loop(app: App) -> Result<()> {
         // otherwise conflict with `&mut current`).
         let App { current, ctx, .. } = &mut app;
         let ctx_ref: &AppContext = ctx;
-        term.terminal.draw(|f| current.draw(f, ctx_ref))?;
+        term.draw_frame(&mut |f| current.draw(f, ctx_ref))?;
 
-        if !event::poll(Duration::from_millis(200))? {
+        if !events.poll(Duration::from_millis(200))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
-        if key.kind != KeyEventKind::Press {
+        let event = events.read()?;
+        let forward = match &event {
+            Event::Key(key) => {
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                true
+            }
+            Event::Mouse(_) => true,
+            _ => false,
+        };
+        if !forward {
             continue;
         }
 
-        match current.handle_event(key, ctx).await {
+        match current.handle_event(event, ctx).await {
             Transition::Stay => {}
             Transition::To(next) => {
                 *current = next;
@@ -254,11 +329,223 @@ impl Screen for StubMenuScreen {
         frame.render_widget(p, frame.area());
     }
 
-    async fn handle_event(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> Transition {
+    async fn handle_event(&mut self, event: Event, _ctx: &mut AppContext) -> Transition {
         use crossterm::event::KeyCode;
-        match key.code {
-            KeyCode::Char('q') => Transition::Quit,
+        match event {
+            Event::Key(key) => match key.code {
+                KeyCode::Char('q') => Transition::Quit,
+                _ => Transition::Stay,
+            },
+            Event::Mouse(_) => Transition::Stay,
             _ => Transition::Stay,
         }
+    }
+}
+
+// ============================================================================
+// Tests — INT-trait-04 / INT-trait-05 (run_inner event dispatch invariants)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use crossterm::event::{
+        KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+
+    fn test_ctx() -> AppContext {
+        let db = crate::library::dao::LibraryDb::open_in_memory().expect("open in-memory db");
+        let scraper = crate::catalog::service::scraper::Scraper::new().expect("scraper init");
+        let config = Config::default();
+        AppContext { db, scraper, config }
+    }
+
+    // -- Mock EventSource ---------------------------------------------------
+
+    struct MockEvents {
+        queue: std::collections::VecDeque<Event>,
+    }
+
+    impl MockEvents {
+        fn new(events: Vec<Event>) -> Self {
+            Self {
+                queue: events.into(),
+            }
+        }
+    }
+
+    impl EventSource for MockEvents {
+        fn poll(&mut self, _dur: Duration) -> Result<bool> {
+            Ok(!self.queue.is_empty())
+        }
+        fn read(&mut self) -> Result<Event> {
+            self.queue
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("queue empty"))
+        }
+    }
+
+    // -- Mock TerminalLike ---------------------------------------------------
+    // 不實際 draw（UT 不 assert render output）；接 closure 但跳過呼叫即可。
+    // 跳過呼叫亦避免「mock screen 沒有真實 draw 邏輯」造成的問題。
+
+    struct NoopTerm;
+
+    impl TerminalLike for NoopTerm {
+        fn draw_frame(&mut self, _f: &mut dyn FnMut(&mut Frame)) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    // -- Mock Screen --------------------------------------------------------
+    // 記錄收到的 events；達到 quit_after 筆數後回 Quit 結束 run_inner。
+
+    struct RecordingScreen {
+        received: std::rc::Rc<std::cell::RefCell<Vec<Event>>>,
+        quit_after: usize,
+        count: usize,
+    }
+
+    impl RecordingScreen {
+        fn new(
+            received: std::rc::Rc<std::cell::RefCell<Vec<Event>>>,
+            quit_after: usize,
+        ) -> Self {
+            Self {
+                received,
+                quit_after,
+                count: 0,
+            }
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl Screen for RecordingScreen {
+        fn draw(&mut self, _frame: &mut Frame, _ctx: &AppContext) {}
+        async fn handle_event(&mut self, event: Event, _ctx: &mut AppContext) -> Transition {
+            self.received.borrow_mut().push(event);
+            self.count += 1;
+            if self.count >= self.quit_after {
+                Transition::Quit
+            } else {
+                Transition::Stay
+            }
+        }
+    }
+
+    /// INT-trait-04: run_inner forwards Mouse events to current screen.
+    ///
+    /// Queue: [Mouse(ScrollUp), Key('q')(quit sentinel via screen)]
+    /// Mock screen quits after receiving 2 events. Verify the Mouse event
+    /// is in the received list (NOT dropped by run_inner like the old
+    /// `else { continue }` path).
+    #[tokio::test]
+    async fn int_trait_04_run_loop_forwards_mouse() {
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Event>::new()));
+        let screen = Box::new(RecordingScreen::new(received.clone(), 2));
+        let ctx = test_ctx();
+        let app = App::new(screen, EntryMode::Menu, ctx);
+
+        let mouse_event = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 1,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        });
+        let quit_key = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
+        let mut events = MockEvents::new(vec![mouse_event.clone(), quit_key]);
+        let mut term = NoopTerm;
+
+        run_inner(app, &mut events, &mut term)
+            .await
+            .expect("run_inner ok");
+
+        let got = received.borrow();
+        assert_eq!(got.len(), 2, "screen 應收到 2 個 events");
+        assert!(
+            matches!(got[0], Event::Mouse(_)),
+            "第一筆應為 Mouse event (run_inner forward 而非 drop)"
+        );
+        assert!(
+            matches!(got[1], Event::Key(_)),
+            "第二筆應為 Key event（quit sentinel）"
+        );
+    }
+
+    /// INT-trait-05: run_inner ignores Resize / Paste / FocusGained.
+    ///
+    /// Queue: [Resize, Paste, FocusGained, Key('q')]
+    /// Mock screen quits on first event received. Verify the first three
+    /// events were NOT forwarded — screen only saw the Key event.
+    #[tokio::test]
+    async fn int_trait_05_run_loop_ignores_resize_paste_focus() {
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Event>::new()));
+        let screen = Box::new(RecordingScreen::new(received.clone(), 1));
+        let ctx = test_ctx();
+        let app = App::new(screen, EntryMode::Menu, ctx);
+
+        let quit_key = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
+        let mut events = MockEvents::new(vec![
+            Event::Resize(80, 24),
+            Event::Paste("clipboard data".into()),
+            Event::FocusGained,
+            quit_key,
+        ]);
+        let mut term = NoopTerm;
+
+        run_inner(app, &mut events, &mut term)
+            .await
+            .expect("run_inner ok (must not panic on Resize/Paste/FocusGained)");
+
+        let got = received.borrow();
+        assert_eq!(
+            got.len(),
+            1,
+            "Resize/Paste/FocusGained 不該 forward；screen 只該收到 1 個 event"
+        );
+        assert!(
+            matches!(got[0], Event::Key(_)),
+            "forwarded event 應為 Key event"
+        );
+        // 也確認三類事件確實不在 received 列表
+        for ev in got.iter() {
+            assert!(!matches!(ev, Event::Resize(_, _)), "Resize 不該 forward");
+            assert!(!matches!(ev, Event::Paste(_)), "Paste 不該 forward");
+            assert!(!matches!(ev, Event::FocusGained), "FocusGained 不該 forward");
+        }
+    }
+
+    /// Extra: Key event with kind != Press 仍然被 run_inner ignore（既有行為不退化）。
+    /// 這條 hint 是 trait migration 期間順手驗證 existing filter 仍然生效，不在
+    /// task ctx 的 5 條 INT-trait 必交清單，但有助 regression coverage。
+    #[tokio::test]
+    async fn run_loop_ignores_key_release() {
+        use crossterm::event::KeyEventState;
+        let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Event>::new()));
+        let screen = Box::new(RecordingScreen::new(received.clone(), 1));
+        let ctx = test_ctx();
+        let app = App::new(screen, EntryMode::Menu, ctx);
+
+        let release = Event::Key(KeyEvent {
+            code: KeyCode::Char('a'),
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Release,
+            state: KeyEventState::empty(),
+        });
+        let quit_key = Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::empty()));
+        let mut events = MockEvents::new(vec![release, quit_key]);
+        let mut term = NoopTerm;
+
+        run_inner(app, &mut events, &mut term).await.expect("ok");
+
+        let got = received.borrow();
+        assert_eq!(got.len(), 1, "Release event 不該 forward");
+    }
+
+    // 抑制未使用 import 警告（MouseButton 在這檔 stub 範例給未來複用）
+    #[allow(dead_code)]
+    fn _silence_unused_mousebutton() -> MouseButton {
+        MouseButton::Left
     }
 }

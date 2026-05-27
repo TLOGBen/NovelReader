@@ -15,7 +15,7 @@
 //! 設回 `true` 即可。
 
 use anyhow::Result;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
@@ -185,9 +185,14 @@ impl Screen for ShelfScreen {
 
     async fn handle_event(
         &mut self,
-        key: KeyEvent,
+        event: Event,
         ctx: &mut AppContext,
     ) -> Transition {
+        let key: KeyEvent = match event {
+            Event::Key(k) => k,
+            Event::Mouse(_) => return Transition::Stay,
+            _ => return Transition::Stay,
+        };
         // 任意鍵清 toast（首次按鍵清 highlight 提示；同時 reset expiry 避免殘留）
         self.toast = None;
         self.toast_expires_at = None;
@@ -273,7 +278,7 @@ mod tests {
     use crate::library::dao::LibraryDb;
     use crate::library::Novel;
     use crate::presentation::AppContext;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyEvent, KeyModifiers};
 
     fn test_ctx_with_one_novel() -> (AppContext, i64, String) {
         let mut db = LibraryDb::open_in_memory().expect("open in-memory db");
@@ -294,8 +299,9 @@ mod tests {
         (ctx, id, "https://book.example/1".into())
     }
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::empty())
+    /// Trait migration: 既有 UT 改為包 Event::Key(...)，行為斷言不變。
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
     }
 
     #[tokio::test]
@@ -374,5 +380,30 @@ mod tests {
         let shelf = ShelfScreen::new();
         assert!(shelf.toast.is_none());
         assert!(shelf.initial_highlight_book_url.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // INT-trait-02: shelf 收 Event::Mouse(Down(Left)) → Transition::Stay
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn int_trait_02_shelf_mouse_stay() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut ctx, _id, _book_url) = test_ctx_with_one_novel();
+        let mut shelf = ShelfScreen::new();
+        shelf.refresh(&ctx).expect("refresh");
+        let before_selected = shelf.list_state.selected();
+        let mouse = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        });
+        let t = shelf.handle_event(mouse, &mut ctx).await;
+        assert!(matches!(t, Transition::Stay), "Mouse 事件應回 Stay");
+        assert_eq!(
+            shelf.list_state.selected(),
+            before_selected,
+            "Mouse 事件不該影響 list_state"
+        );
     }
 }

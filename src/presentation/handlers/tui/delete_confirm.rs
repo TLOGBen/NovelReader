@@ -16,7 +16,7 @@
 //! DB 變動導致書名漂移。
 
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::Rect,
     style::{Color, Style},
@@ -80,7 +80,12 @@ impl Screen for DeleteConfirmScreen {
         frame.render_widget(prompt, inner);
     }
 
-    async fn handle_event(&mut self, key: KeyEvent, ctx: &mut AppContext) -> Transition {
+    async fn handle_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition {
+        let key: KeyEvent = match event {
+            Event::Key(k) => k,
+            Event::Mouse(_) => return Transition::Stay,
+            _ => return Transition::Stay,
+        };
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 // 失敗也帶錯誤 toast 回 menu（不重試、不卡 modal）
@@ -106,7 +111,7 @@ mod tests {
     use crate::library::dao::LibraryDb;
     use crate::library::Novel;
     use crate::presentation::AppContext;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyEvent, KeyModifiers};
 
     fn test_ctx_with_novel() -> (AppContext, i64) {
         let mut db = LibraryDb::open_in_memory().expect("open in-memory db");
@@ -127,8 +132,9 @@ mod tests {
         (ctx, id)
     }
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::empty())
+    /// Trait migration: 既有 UT 改為包 Event::Key(...)，行為斷言不變。
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
     }
 
     #[test]
@@ -218,5 +224,31 @@ mod tests {
         let _t = s.handle_event(press(KeyCode::Char('x')), &mut ctx).await;
         let novel = library_facade::get_novel(&ctx.db, novel_id).unwrap();
         assert!(novel.is_some(), "unknown key must default to cancel (not delete)");
+    }
+
+    // ------------------------------------------------------------------
+    // INT-trait-03: delete_confirm 收 Event::Mouse(ScrollUp) → Transition::Stay
+    // 並驗證：mouse 不該觸發刪除（書還在）
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn int_trait_03_delete_confirm_mouse_stay() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let (mut ctx, novel_id) = test_ctx_with_novel();
+        let mut s = DeleteConfirmScreen::new(
+            novel_id,
+            "凡人修仙傳".into(),
+            "https://book.example/1".into(),
+        );
+        let mouse = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        let t = s.handle_event(mouse, &mut ctx).await;
+        assert!(matches!(t, Transition::Stay), "Mouse 事件應回 Stay");
+        // 確認沒被刪
+        let novel = library_facade::get_novel(&ctx.db, novel_id).unwrap();
+        assert!(novel.is_some(), "Mouse 事件不該觸發刪除");
     }
 }

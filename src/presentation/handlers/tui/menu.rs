@@ -8,7 +8,7 @@
 //!
 //! 「設定」分支同樣用 settings_stub_msg 顯示「尚未實作」、任意其他鍵清除提示。
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent};
 use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
@@ -122,7 +122,12 @@ impl Screen for MenuScreen {
         frame.render_widget(Paragraph::new(status_text), chunks[2]);
     }
 
-    async fn handle_event(&mut self, key: KeyEvent, _ctx: &mut AppContext) -> Transition {
+    async fn handle_event(&mut self, event: Event, _ctx: &mut AppContext) -> Transition {
+        let key: KeyEvent = match event {
+            Event::Key(k) => k,
+            Event::Mouse(_) => return Transition::Stay,
+            _ => return Transition::Stay,
+        };
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.selected = (self.selected + 1) % ITEMS.len();
@@ -172,7 +177,7 @@ mod tests {
     use super::*;
     use crate::config::Config;
     use crate::presentation::AppContext;
-    use crossterm::event::{KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyEvent, KeyModifiers};
 
     /// 構造一個僅供測試使用的 AppContext（in-memory DB，real scraper）。
     fn test_ctx() -> AppContext {
@@ -184,8 +189,9 @@ mod tests {
         AppContext { db, scraper, config }
     }
 
-    fn press(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::empty())
+    /// Trait migration: 既有 UT 改為包 Event::Key(...)，行為斷言不變。
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent::new(code, KeyModifiers::empty()))
     }
 
     #[test]
@@ -310,5 +316,28 @@ mod tests {
         assert!(m.settings_stub_msg.is_some());
         let _ = m.handle_event(press(KeyCode::Char('j')), &mut ctx).await;
         assert!(m.settings_stub_msg.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // INT-trait-01: menu screen 收 Event::Mouse(ScrollUp) → Transition::Stay
+    // ------------------------------------------------------------------
+    #[tokio::test]
+    async fn int_trait_01_menu_mouse_stay() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let mut m = MenuScreen::new();
+        let mut ctx = test_ctx();
+        let before_selected = m.selected;
+        let mouse = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        });
+        let t = m.handle_event(mouse, &mut ctx).await;
+        assert!(matches!(t, Transition::Stay), "Mouse 事件應回 Stay");
+        assert_eq!(
+            m.selected, before_selected,
+            "Mouse 事件不該影響 selected state"
+        );
     }
 }
