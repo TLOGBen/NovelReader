@@ -243,6 +243,25 @@ impl LibraryDb {
         Ok(p)
     }
 
+    // ---- shelf delete (REQ — shelf delete /think 2026-05-27) ----
+
+    /// Atomically remove a novel and its dependent rows.
+    ///
+    /// Single transaction wraps explicit DELETE of progress → chapters → novels.
+    /// Explicit (not relying on ON DELETE CASCADE) because production `open()`
+    /// does not enable `PRAGMA foreign_keys = ON` (see `open_in_memory` note),
+    /// so cascade would silently leave orphan rows.
+    ///
+    /// Idempotent: non-existent `novel_id` returns Ok (DELETE on 0 rows is Ok).
+    pub fn delete_novel_tx(&mut self, novel_id: i64) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM progress WHERE novel_id=?", [novel_id])?;
+        tx.execute("DELETE FROM chapters WHERE novel_id=?", [novel_id])?;
+        tx.execute("DELETE FROM novels WHERE id=?", [novel_id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
     // ---- switch-source transaction (REQ-005) ----
 
     /// Atomically swap a novel's source + TOC + reset progress to new TOC's first idx.
@@ -718,6 +737,83 @@ mod tests {
             .get_novel_by_book_url("https://nonexistent.example/no-such-book")
             .expect("query should succeed");
         assert!(got.is_none());
+    }
+
+    // ---- delete_novel_tx ----
+
+    #[test]
+    fn delete_novel_tx_removes_novel_chapters_and_progress() {
+        let mut f = setup_fixture();
+
+        // Pre-conditions: 1 novel, 5 chapters, 1 progress row.
+        let novels_before: i64 = f
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM novels WHERE id=?", [f.novel_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(novels_before, 1);
+        let chapters_before: i64 = f
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM chapters WHERE novel_id=?",
+                [f.novel_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chapters_before, 5);
+        let progress_before: i64 = f
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM progress WHERE novel_id=?",
+                [f.novel_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(progress_before, 1);
+
+        f.db.delete_novel_tx(f.novel_id).expect("delete should succeed");
+
+        let novels_after: i64 = f
+            .db
+            .conn
+            .query_row("SELECT COUNT(*) FROM novels WHERE id=?", [f.novel_id], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(novels_after, 0, "novels row must be gone");
+
+        let chapters_after: i64 = f
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM chapters WHERE novel_id=?",
+                [f.novel_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(chapters_after, 0, "chapters must cascade-delete");
+
+        let progress_after: i64 = f
+            .db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM progress WHERE novel_id=?",
+                [f.novel_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(progress_after, 0, "progress must cascade-delete");
+    }
+
+    #[test]
+    fn delete_novel_tx_idempotent_on_nonexistent_id() {
+        let mut db = LibraryDb::open_in_memory().expect("open in-memory db");
+        let res = db.delete_novel_tx(99_999);
+        assert!(res.is_ok(), "deleting non-existent id must be Ok");
     }
 
     // ---- Defensive: empty new_chapters ----

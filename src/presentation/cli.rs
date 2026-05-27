@@ -68,6 +68,14 @@ pub enum Cmd {
     },
     /// 依據設定執行備份（export → 推到 local / webdav backend）
     Backup,
+    /// 從書架移除（hard delete：novel + chapters + progress 一併刪）
+    Remove {
+        /// 書架上的 novel_id
+        novel_id: i64,
+        /// 跳過互動式 [y/N] 確認（用於 script / batch）
+        #[arg(long)]
+        yes: bool,
+    },
     /// 換源（將書架上某本書換綁到另一個書源；REQ-005 Scenario 6）
     SwitchSource {
         /// 書架上的 novel_id
@@ -121,6 +129,9 @@ pub async fn run(cli: Cli, mut ctx: AppContext) -> Result<()> {
         Some(Cmd::Export { path }) => handlers::export::handle(path, &mut ctx).await,
         Some(Cmd::Import { path }) => handlers::import::handle(path, &mut ctx).await,
         Some(Cmd::Backup) => handlers::backup::handle(&mut ctx).await,
+        Some(Cmd::Remove { novel_id, yes }) => {
+            handlers::remove::handle(novel_id, yes, &mut ctx).await
+        }
         Some(Cmd::SwitchSource { novel_id, new_book_url, source }) => {
             handlers::switch_source::handle(novel_id, new_book_url, source, &mut ctx).await
         }
@@ -162,6 +173,34 @@ mod tests {
                 assert_eq!(source, "https://czbooks.net");
             }
             other => panic!("expected Cmd::SwitchSource, got {other:?}"),
+        }
+    }
+
+    /// Shelf delete CLI parity (/think 2026-05-27): `remove <id> [--yes]`
+    /// parses into `Cmd::Remove { novel_id, yes }`.
+    #[test]
+    fn cli_remove_with_yes_flag_parses() {
+        let cli = Cli::try_parse_from(["novel-looker", "remove", "42", "--yes"])
+            .expect("clap should accept remove --yes");
+        match cli.cmd {
+            Some(Cmd::Remove { novel_id, yes }) => {
+                assert_eq!(novel_id, 42);
+                assert!(yes);
+            }
+            other => panic!("expected Cmd::Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_remove_without_yes_defaults_false() {
+        let cli = Cli::try_parse_from(["novel-looker", "remove", "7"])
+            .expect("clap should accept remove without --yes");
+        match cli.cmd {
+            Some(Cmd::Remove { novel_id, yes }) => {
+                assert_eq!(novel_id, 7);
+                assert!(!yes);
+            }
+            other => panic!("expected Cmd::Remove, got {other:?}"),
         }
     }
 

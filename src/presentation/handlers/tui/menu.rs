@@ -16,8 +16,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
     Frame,
 };
+use std::time::Instant;
 
-use crate::presentation::handlers::tui::{Screen, Transition};
+use crate::presentation::handlers::tui::{Screen, Transition, TOAST_TTL};
 use crate::presentation::AppContext;
 
 const ITEMS: [&str; 4] = ["書架", "搜尋蒐書", "設定", "離開"];
@@ -27,9 +28,12 @@ pub struct MenuScreen {
     selected: usize,
     settings_stub_msg: Option<&'static str>,
     /// 動態 toast（owned String）— 由 `with_toast` 帶入，供 SearchScreen 入架
-    /// 成功跳回主菜單時顯示「已入架 #ID 書名」。任意鍵清除（與 `settings_stub_msg`
-    /// 同樣的暫時性訊息語意）。
+    /// 成功 / 書架刪除成功跳回主菜單時顯示。首次按鍵清除，或 `toast_expires_at`
+    /// 過期後 draw 時不渲染（兩條件擇一）。
     toast: Option<String>,
+    /// Toast 過期時間。`None` = 永不過期（保留 first-key-clear 行為）。
+    /// `with_toast` 預設 [`TOAST_TTL`]；`with_toast_until` 由 caller 指定。
+    pub(crate) toast_expires_at: Option<Instant>,
 }
 
 impl MenuScreen {
@@ -39,18 +43,35 @@ impl MenuScreen {
             selected: 0,
             settings_stub_msg: None,
             toast: None,
+            toast_expires_at: None,
         }
     }
 
-    /// 帶 toast 構造 — SearchScreen 入架成功後 `Transition::To(...)` 用，
-    /// 在主菜單頂端顯示「已入架 #ID 書名」一行。首次按鍵清除。
+    /// 帶 toast 構造 — 預設 [`TOAST_TTL`] (3s) 後自消（仍保留 first-key-clear）。
     #[allow(dead_code)]
     pub fn with_toast(toast: String) -> Self {
+        Self::with_toast_until(toast, Instant::now() + TOAST_TTL)
+    }
+
+    /// 顯式指定過期時間的 ctor — 主要給 UT 用，但也可給未來想客製 TTL 的 caller。
+    #[allow(dead_code)]
+    pub fn with_toast_until(toast: String, expires_at: Instant) -> Self {
         Self {
             selected: 0,
             settings_stub_msg: None,
             toast: Some(toast),
+            toast_expires_at: Some(expires_at),
         }
+    }
+
+    /// 回傳「目前還該顯示的 toast」— toast 不存在 → None；過期 → None；
+    /// 仍有效 → Some(&str)。draw / UT 都靠這個 helper 統一邏輯。
+    #[allow(dead_code)]
+    pub fn toast_active(&self) -> Option<&str> {
+        self.toast.as_deref().filter(|_| {
+            self.toast_expires_at
+                .map_or(true, |t| Instant::now() < t)
+        })
     }
 }
 
@@ -93,7 +114,7 @@ impl Screen for MenuScreen {
         state.select(Some(self.selected));
         frame.render_stateful_widget(list, chunks[1], &mut state);
 
-        let status_text = match (&self.toast, self.settings_stub_msg) {
+        let status_text = match (self.toast_active(), self.settings_stub_msg) {
             (Some(t), _) => format!("j/k 上下、Enter 進入、q 離開\n{}", t),
             (None, Some(msg)) => format!("j/k 上下、Enter 進入、q 離開\n{}", msg),
             (None, None) => "j/k 上下、Enter 進入、q 離開".to_string(),
@@ -107,6 +128,7 @@ impl Screen for MenuScreen {
                 self.selected = (self.selected + 1) % ITEMS.len();
                 self.settings_stub_msg = None;
                 self.toast = None;
+                self.toast_expires_at = None;
                 Transition::Stay
             }
             KeyCode::Char('k') | KeyCode::Up => {
@@ -117,6 +139,7 @@ impl Screen for MenuScreen {
                 };
                 self.settings_stub_msg = None;
                 self.toast = None;
+                self.toast_expires_at = None;
                 Transition::Stay
             }
             KeyCode::Enter => match self.selected {
@@ -137,6 +160,7 @@ impl Screen for MenuScreen {
             _ => {
                 self.settings_stub_msg = None;
                 self.toast = None;
+                self.toast_expires_at = None;
                 Transition::Stay
             }
         }
@@ -240,6 +264,41 @@ mod tests {
         let m = MenuScreen::with_toast("已入架 #5 超維術士".to_string());
         assert_eq!(m.selected, 0);
         assert_eq!(m.toast.as_deref(), Some("已入架 #5 超維術士"));
+    }
+
+    #[test]
+    fn toast_active_returns_some_when_not_expired() {
+        use std::time::{Duration, Instant};
+        let m = MenuScreen::with_toast_until(
+            "fresh".into(),
+            Instant::now() + Duration::from_secs(10),
+        );
+        assert_eq!(m.toast_active(), Some("fresh"));
+    }
+
+    #[test]
+    fn toast_active_returns_none_when_expired() {
+        use std::time::{Duration, Instant};
+        let m = MenuScreen::with_toast_until(
+            "stale".into(),
+            Instant::now() - Duration::from_secs(1),
+        );
+        assert!(m.toast_active().is_none(), "已過期 toast 不該再顯示");
+    }
+
+    #[test]
+    fn with_toast_defaults_to_3s_ttl() {
+        // 構造後立即查看：toast_expires_at 必須 Some 且大於 now
+        use std::time::Instant;
+        let m = MenuScreen::with_toast("hi".into());
+        let exp = m.toast_expires_at.expect("with_toast must set TTL");
+        assert!(exp > Instant::now(), "TTL 必須在未來");
+        // 不能超過 4 秒（給 1 秒寬容）
+        let now = Instant::now();
+        assert!(
+            exp <= now + std::time::Duration::from_secs(4),
+            "TTL 預設應約 3 秒"
+        );
     }
 
     #[tokio::test]

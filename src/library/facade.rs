@@ -34,6 +34,14 @@ pub fn get_novel_by_book_url(db: &LibraryDb, book_url: &str) -> Result<Option<No
     db.get_novel_by_book_url(book_url)
 }
 
+/// Shelf delete — pass-through over atomic dao transaction.
+///
+/// Removes the novel and its dependent chapters / progress rows in one
+/// transaction. Idempotent: non-existent `novel_id` returns Ok.
+pub fn delete_novel(db: &mut LibraryDb, novel_id: i64) -> Result<()> {
+    db.delete_novel_tx(novel_id)
+}
+
 /// REQ-005 switch-source — thin pass-through over the dao transaction.
 ///
 /// Caller (presentation handler) is responsible for the upstream catalog
