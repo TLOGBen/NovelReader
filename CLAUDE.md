@@ -226,17 +226,120 @@ src/catalog src/library` 仍應零命中 — catalog/library 內部不互呼 fac
 （`App::new_with_menu`）；`tui <id>` 走 `App::new_with_direct_reader`；其他既有
 子命令維持。
 
-### TUI (`src/presentation/reader.rs`)
+### TUI Reader (`src/presentation/handlers/tui/reader.rs`)
 
-Two-pane layout. The fetch is awaited **inline** inside the event loop
-(blocks UI for ~1–3s). If you make fetching truly async, add a tokio mpsc
-channel and `tokio::select!` over `event::poll` + channel `recv`.
+Two-pane layout: TOC（30% 寬，可 `t` 縮為 0）+ content。Reader 採 **Eager 3-chapter
+buffer + mode state machine** 架構（2026-05-27 重寫，commit `7c54bb...` 之後）：
 
-Keybindings: `j/k` chapters | `J/K`/`Space`/`PgUp/Dn` scroll | `n/p` next/prev
-chapter | `Tab` switch focus | `g/G` head/tail | `q` quit.
+**Buffer model**
 
-Progress (`chapter_index` + `scroll_offset`) is saved on every chapter change
-and on quit via `library::facade::save_progress`.
+- state 持 `ChapterBuffer { combined_text, prev/curr/next_chapter_idx, prev_end_row, curr_end_row }`
+  — prev + curr + next 三章拼成單一 String，分隔 `"\n\n"`
+- `init_buffer(curr_idx, ...)` 用於 reader 開啟（任一章 fetch 失敗 → 整個 reader 開不起來，
+  上層帶 toast 提示）；`rebuild_buffer(curr_idx, ...) -> Result<_, RebuildError>` 用於
+  reader 內跳章（`CurrFailed` → 保留舊 buffer + toast；`PartialDegraded(buf)` → 用降級
+  buffer + toast）
+- 第 0 章 / 最後章自動降級為 2 章 buffer（prev / next 為 None、對應 end_row 為 0）
+- scroll 越 prev 開頭 / 越 next 結尾 → 自動 `rebuild_buffer(viewport_top_chapter)`；
+  prev=None / next=None 時鎖在邊界、不再 rebuild（避免遞迴）
+- 跳 TOC = 完整 rebuild + scroll = `new_buf.prev_end_row`（viewport 對齊新 curr 開頭）
+
+**Mode state machine**
+
+```
+ReaderMode::Normal
+ReaderMode::Filter { query: String, filtered_indices: Vec<usize>, selected: usize }
+```
+
+- Normal 模式：既有 j/k/Tab/Space/PgUp/Dn/g/G/q/m/n/p 鍵 + 新加 `t` (TOC toggle) / `/` (進 Filter)
+- Filter 模式：`Char(c)` append query 並重算 fuzzy filter、`Backspace` 刪 / `Esc` 退 / `Enter`
+  跳到 `chapters[filtered_indices[selected]]` / `j`/`k` 移 `selected`
+- **重要規則**：Filter 模式下 *所有* printable Char 一律 append query（包含 `t` / `q` / `/`），
+  否則 query 永遠輸不進這些字元
+- `/` 進入 Filter 時強制 `toc_collapsed = false`（filter 看 TOC 列才有意義）；退出不還原
+- Filter 模式 Mouse click 等同 Enter 路徑
+
+**Scraper injection seam (test only)**
+
+- `pub(crate) trait ScraperLike { async fn fetch_chapter_content(src, url) -> Result<String> }`
+- production `impl ScraperLike for catalog::Scraper`
+- `init_buffer<S>` / `rebuild_buffer<S>` 兩支 fn 都 generic over `S: ScraperLike` —
+  UT 直接傳 `MockScraper { by_url, panic_on_call }` 注入；handle_event 透過
+  `apply_*` wrapper 把 production scraper 從 `&mut AppContext` 解出來
+- 配 `ratatui::backend::TestBackend` 做 draw round-trip 驗證（如 `toc_width_cached`
+  在 draw 後更新）
+
+**純函數 (Testability Seam 3)**
+
+抽成 free fn 方便 UT 直接呼：
+- `viewport_top_chapter(buffer, scroll) -> i64` — scroll 落在哪段（prev / curr / next）
+- `progress_text(buffer, scroll, total) -> String` — 底端進度條「第 X 章 / 共 N 章 (Y%)」，
+  X = `viewport_top_chapter + 1`、Y 用 u64 算
+- `hit_test_pane(column, toc_width) -> Pane` — mouse hit 在 TOC 還 Content
+- `hit_test_toc_row(row, list_offset, items_count) -> Option<usize>` —
+  row → list idx（含 None 防越界），list_offset = 1（top border）
+- `apply_fuzzy_filter(query, chapters) -> Vec<usize>` —
+  SkimMatcherV2 對 `ChapterMeta.name` 跑分、score desc
+
+**Mouse 行為**
+
+| Event | Normal mode | Filter mode |
+|---|---|---|
+| Wheel @ TOC pane | 跳上/下章（rebuild） | `selected ± 1` in filtered_indices |
+| Wheel @ Content pane | scroll ±3 行 | (no-op) |
+| Wheel @ collapsed TOC | 視為 content pane | (同) |
+| Click(Left) @ TOC row | `apply_jump_to(row idx)` | 跳到 `chapters[filtered_indices[row]]` + 退 Filter |
+| Click(Left) @ Content | no-op | no-op |
+
+**Toast 機制**
+
+reuse shelf-delete 引入的 `TOAST_TTL = 3 秒` + `toast_active()` pattern：
+`toast: Option<String>` + `toast_expires_at: Option<Instant>`、draw 走 `toast_active()`
+getter（用 `Option::filter` 判過期）。rebuild 失敗時設 toast 顯示 3 秒。
+
+**Keybindings 一覽**
+
+```
+Normal:
+  j / k         上/下一章（跳章 + rebuild）
+  n / p         同 j / k（保留）
+  J / K         scroll ± content_area_h
+  Space / PgDn  scroll +content_area_h
+  PgUp          scroll -content_area_h
+  g / G         buffer 開頭 / 結尾
+  Tab           focus TOC / Content 切換
+  t             TOC pane 縮合 / 展開 (30% ↔ 0%)
+  /             進 Filter mode
+  q / m         save progress 後退出
+  Mouse Wheel   pane-aware：TOC = 跳章 / Content = ±3 行
+  Mouse Click   點 TOC row 跳該章
+
+Filter:
+  Char          append query + 重算 filter
+  Backspace     pop query（空 → no-op）
+  j / k         filtered_indices selected ± 1
+  Enter         跳 chapters[filtered_indices[selected]] + 退 Filter（空 filter → no-op）
+  Esc           退 Filter（buffer / scroll / current 不變）
+  Mouse Wheel   TOC pane = selected ± 1（不改 reader.current）/ Content = no-op
+  Mouse Click   點 row = 跳 + 退 Filter
+```
+
+**Trait sig（infra 重寫）**
+
+```rust
+#[async_trait::async_trait(?Send)]
+pub trait Screen {
+    async fn handle_event(&mut self, event: Event, ctx: &mut AppContext) -> Transition;
+    fn draw(&mut self, f: &mut Frame, ctx: &AppContext);
+}
+```
+
+`run_loop` 內部 `run_inner<E: EventSource, T: TerminalLike>` — 兩個 trait 是 UT 注入
+testable seam，production 用 `CrosstermEventSource` + `RawTerm`。run_loop forward
+`Event::Key | Event::Mouse`；`Resize / Paste / FocusGained` 走 `continue`。
+
+Progress (`chapter_index` + `scroll_offset`) 在每次跳章與 quit 時 save 到
+`library::facade::save_progress`。
 
 ### Backup / config (`src/backup/`, `src/config.rs`)
 
@@ -252,15 +355,29 @@ and on quit via `library::facade::save_progress`.
   the config file. Prefer the env var — config files end up in screenshots and
   git diffs.
 
-## Claude plugin scaffolding
+## Claude plugin
 
-- `.claude/plugin.json` — manifest, references the skills
-- `.claude/skills/parse-novel-site/SKILL.md` — given a URL, produce a
-  validated `book-sources/<site>.json`; the skill spec defines the validation
-  commands and the rule DSL (keep that section in sync with
-  `src/catalog/service/rule.rs`)
-- `.claude/skills/add-to-shelf/SKILL.md` — wraps `add → sync → tui`
-- `.claude/skills/legado-converter/SKILL.md` — port Legado / 閱讀 3.0 JSON sources
+本 repo 是一個 Claude Code plugin。manifest 在 `.claude-plugin/plugin.json`
+（Claude Code CLI 期待的標準路徑）：
+
+```bash
+# 驗證 manifest
+claude plugin validate .
+
+# session-only 載入（不 install）
+cd /home/vakarve/projects/rust/novel-looker
+claude --plugin-dir .
+
+# 或永久 install（從 local path 當 marketplace）
+claude plugin marketplace add /home/vakarve/projects/rust/novel-looker
+claude plugin install novel-looker
+```
+
+skills（在 `.claude/skills/`，由 plugin.json 引用）：
+- `parse-novel-site/SKILL.md` — 給 URL，自動分析 DOM 結構，產 `book-sources/<site>.json`
+  （rule DSL 描述要與 `src/catalog/service/rule.rs` 同步）
+- `add-to-shelf/SKILL.md` — 包 `add → sync → tui` 流程
+- `legado-converter/SKILL.md` — 把 Legado / 閱讀 3.0 JSON 書源轉本專案格式
 
 When changing the rule grammar or `BookSource` fields, update
 `parse-novel-site/SKILL.md` so generated sources stay valid.
