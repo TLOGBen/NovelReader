@@ -49,15 +49,18 @@ pub fn delete_novel(db: &mut LibraryDb, novel_id: i64) -> Result<()> {
 /// five-class pre-checks. This facade only wraps the atomic dao step —
 /// never imports `catalog::*` (REQ-007 layer invariant).
 ///
-/// Returns the new `progress.chapter_index` (= first idx of `new_chapters`).
+/// Returns the new `progress.chapter_index` — equals `target_idx` if the caller
+/// supplied an in-bounds value, otherwise falls back to the first idx of
+/// `new_chapters`. See `LibraryDb::update_book_source_tx` for the bounds rule.
 pub fn switch_source_tx(
     db: &mut LibraryDb,
     novel_id: i64,
     new_src_url: &str,
     new_book_url: &str,
     new_chapters: &[ChapterMeta],
+    target_idx: Option<i64>,
 ) -> Result<i64> {
-    db.update_book_source_tx(novel_id, new_src_url, new_book_url, new_chapters)
+    db.update_book_source_tx(novel_id, new_src_url, new_book_url, new_chapters, target_idx)
 }
 
 /// TUI reader — list chapters for a novel.

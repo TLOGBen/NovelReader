@@ -31,9 +31,11 @@ use crate::catalog::BookSource;
 use crate::library;
 use crate::library::dao::LibraryDb;
 use crate::library::{ChapterMeta, Novel, ReadProgress};
+use crate::presentation::handlers::tui::picker::{PickerEntry, SearchPickerScreen};
 use crate::presentation::handlers::tui::{
     menu::MenuScreen, EntryMode, Screen, Transition, TOAST_TTL,
 };
+use std::sync::Arc;
 use crate::presentation::AppContext;
 
 // ---------------------------------------------------------------------------
@@ -353,17 +355,31 @@ pub(crate) fn progress_text(buffer: &ChapterBuffer, scroll: u16, total: usize) -
     format!("第 {} 章 / 共 {} 章 ({}%)", x_i64, total, percent)
 }
 
-/// REQ-003 (TASK-reader-toc-02) — fuzzy filter helper.
+/// REQ-003 (TASK-reader-toc-02) / REQ-002 (TASK-shared-01) — fuzzy filter helper.
 ///
-/// 對 `chapters[*].name` 跑 SkimMatcherV2 fuzzy match，命中者按 score
-/// 降序排列、回傳對應 `chapters` index 列表。
+/// 對 `chapters[*].name` 跑 SkimMatcherV2 fuzzy match，命中者按 score 降序排列、
+/// 回傳 `(index, score)` 對清單。
 ///
-/// `query` 為空 → 回傳 `(0..chapters.len()).collect()`（不過濾）。
+/// 排序規則：
+/// - primary: `score desc`（既有 SkimMatcherV2）
+/// - secondary (anchor=Some(a)): `|idx as i64 - a| asc`（距 anchor 近者排前，
+///   供 picker confirm phase fuzzy 章節對應使用）
+/// - anchor=None: 不加 secondary key、走 stable order（與 TASK-reader-toc-02
+///   擴前等價，既有 reader Filter mode caller 行為不退化）
 ///
-/// Free fn（不掛 method）讓 INT-mode-02/03 可不需 ReaderScreen 直接驗。
-pub(crate) fn apply_fuzzy_filter(query: &str, chapters: &[ChapterMeta]) -> Vec<usize> {
+/// `query` 為空 → 回傳所有 chapter 配 `score=0` 的 `(idx, 0)` 對（不過濾、
+/// score 預設 0）；caller 既有 wrap `.into_iter().map(|(i,_)| i).collect()`
+/// 行為與本次擴前等價（idx 順序 0..N、stable）。
+///
+/// Free fn（不掛 method）讓 INT-mode-02/03 + picker UT 可不需 ReaderScreen
+/// 直接驗。
+pub(crate) fn apply_fuzzy_filter(
+    query: &str,
+    chapters: &[ChapterMeta],
+    anchor: Option<i64>,
+) -> Vec<(usize, i64)> {
     if query.is_empty() {
-        return (0..chapters.len()).collect();
+        return (0..chapters.len()).map(|i| (i, 0)).collect();
     }
     let matcher = SkimMatcherV2::default();
     let mut scored: Vec<(usize, i64)> = chapters
@@ -371,8 +387,40 @@ pub(crate) fn apply_fuzzy_filter(query: &str, chapters: &[ChapterMeta]) -> Vec<u
         .enumerate()
         .filter_map(|(i, c)| matcher.fuzzy_match(&c.name, query).map(|s| (i, s)))
         .collect();
-    scored.sort_by(|a, b| b.1.cmp(&a.1));
-    scored.into_iter().map(|(i, _)| i).collect()
+    // primary: score desc；secondary (anchor=Some): |idx - anchor| asc。
+    // anchor=None → 第二鍵恆等，sort_by 為 stable sort、命中順序保留。
+    scored.sort_by(|a, b| {
+        b.1.cmp(&a.1).then_with(|| {
+            if let Some(anc) = anchor {
+                let pa = (a.0 as i64 - anc).abs();
+                let pb = (b.0 as i64 - anc).abs();
+                pa.cmp(&pb)
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+    });
+    scored
+}
+
+/// REQ-002 (TASK-shared-01) — picker confirm phase 取 best 章節對應。
+///
+/// 因 `apply_fuzzy_filter` 內部已含 primary score desc + secondary
+/// `|idx - anchor| asc` 排序，本 helper 退化為「取 scored 第一筆」+ 空時
+/// 回 `None`。
+///
+/// `anchor` 參數保留供未來 picker UT 可在 scored 已固定下重新驗 best —
+/// 目前不重排序（避免重複 sort 成本）。
+///
+/// `#[allow(dead_code)]`：本 task 只建立 helper，picker.rs production
+/// caller 為後續 task（INT-fuzzy-threshold picker 端）；`cargo build` 看
+/// 不到 test 模組故會誤報 dead_code。picker wire 後可移除 allow。
+#[allow(dead_code)]
+pub(crate) fn pick_best_with_anchor(
+    scored: &[(usize, i64)],
+    _anchor: Option<i64>,
+) -> Option<(usize, i64)> {
+    scored.first().copied()
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +509,53 @@ pub(crate) enum ReaderMode {
         filtered_indices: Vec<usize>,
         selected: usize,
     },
+}
+
+// ---------------------------------------------------------------------------
+// Reader 's' caller-side guard — REQ-005 entry into SearchPickerScreen
+// (mirror of shelf::classify_s_press wire-01 pattern). `handle_event` 在
+// Normal mode 'Char(s)' arm 內呼用，依回傳值組 Transition / picker。
+// ---------------------------------------------------------------------------
+
+/// Outcome of pressing 's' inside ReaderScreen Normal mode.
+///
+/// 純資料 — `handle_event` 負責把 variant 轉為 `Transition`：
+///   - `OpenPicker` → 用欄位構造 SearchPickerScreen + spawn_searches、
+///     回 `Transition::To(picker)`。
+///   - `ToastChapterNotFound` → set self.toast + toast_expires_at、
+///     回 `Transition::Stay`。
+#[derive(Debug)]
+pub(crate) enum ReaderSAction {
+    /// Anchor 解析成功（chapters[current] 存在）— 直接帶 picker 構造所需欄位。
+    OpenPicker {
+        novel_id: i64,
+        book_name: String,
+        author: String,
+        old_chapter_idx: i64,
+        old_chapter_name: String,
+    },
+    /// reader.current 越界 chapters[] → 不可換源、走 toast path。
+    ToastChapterNotFound,
+}
+
+/// Pure classifier — 決定 reader Normal mode 按 's' 應做什麼。
+///
+/// `reader.novel.name` / `reader.novel.author` 直接從 ReaderScreen 既有
+/// `novel: Novel` 欄位取（reader ctor 已 load）— 不再 round-trip DB。
+/// `old_chapter_idx` = `reader.current as i64`；`old_chapter_name` =
+/// `chapters[current].name`；越界 → `ToastChapterNotFound`。
+pub(crate) fn classify_s_press_reader(reader: &ReaderScreen) -> ReaderSAction {
+    let pos = reader.current;
+    match reader.chapters.get(pos) {
+        Some(meta) => ReaderSAction::OpenPicker {
+            novel_id: reader.novel_id,
+            book_name: reader.novel.name.clone(),
+            author: reader.novel.author.clone().unwrap_or_default(),
+            old_chapter_idx: pos as i64,
+            old_chapter_name: meta.name.clone(),
+        },
+        None => ReaderSAction::ToastChapterNotFound,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -859,7 +954,11 @@ impl ReaderScreen {
                     return;
                 };
                 // Stage 2: 重算 filter（讀 self.chapters，無 mut borrow）。
-                let new_filter = apply_fuzzy_filter(&new_query, &self.chapters);
+                let new_filter: Vec<usize> =
+                    apply_fuzzy_filter(&new_query, &self.chapters, None)
+                        .into_iter()
+                        .map(|(i, _)| i)
+                        .collect();
                 // Stage 3: 寫回 filtered_indices / selected。
                 if let ReaderMode::Filter {
                     filtered_indices,
@@ -899,7 +998,11 @@ impl ReaderScreen {
                 } else {
                     return;
                 };
-                let new_filter = apply_fuzzy_filter(&new_query, &self.chapters);
+                let new_filter: Vec<usize> =
+                    apply_fuzzy_filter(&new_query, &self.chapters, None)
+                        .into_iter()
+                        .map(|(i, _)| i)
+                        .collect();
                 if let ReaderMode::Filter {
                     query,
                     filtered_indices,
@@ -980,6 +1083,62 @@ impl Screen for ReaderScreen {
                 // REQ-002 (TASK-reader-toc-01): Normal mode toggle TOC；Filter
                 // mode 由上方 dispatch 攔截，此處只接 Normal。
                 self.toc_collapsed = !self.toc_collapsed;
+            }
+            KeyCode::Char('s') if matches!(self.mode, ReaderMode::Normal) => {
+                // REQ-005 S3 (TASK-tui-wire-02): reader Normal mode 's' wire 到
+                // SearchPickerScreen with PickerEntry::Reader{prev_chapter_idx}.
+                // Filter mode 已在上層 dispatch 攔截走 handle_filter_key、不會撞
+                // 此 arm；mode guard 為雙保險。
+                match classify_s_press_reader(self) {
+                    ReaderSAction::ToastChapterNotFound => {
+                        self.toast =
+                            Some("找不到舊章節，無法換源".to_string());
+                        self.toast_expires_at = Some(Instant::now() + TOAST_TTL);
+                        return Transition::Stay;
+                    }
+                    ReaderSAction::OpenPicker {
+                        novel_id,
+                        book_name,
+                        author,
+                        old_chapter_idx,
+                        old_chapter_name,
+                    } => {
+                        let mut picker = SearchPickerScreen::new(
+                            PickerEntry::Reader {
+                                previous_chapter_idx: self.current as i64,
+                            },
+                            novel_id,
+                            book_name,
+                            author,
+                            old_chapter_idx,
+                            old_chapter_name,
+                        );
+                        // 同 shelf wire-01 pattern：ctx.scraper 沒 Clone，
+                        // 為 spawn_searches 另起一個 Arc-wrap 的 Scraper。
+                        // Scraper::new 失敗 → set toast，不開 picker。
+                        let scraper = match catalog::service::scraper::Scraper::new()
+                        {
+                            Ok(s) => Arc::new(s),
+                            Err(e) => {
+                                self.toast = Some(format!(
+                                    "無法初始化 scraper：{:#}",
+                                    e
+                                ));
+                                self.toast_expires_at =
+                                    Some(Instant::now() + TOAST_TTL);
+                                return Transition::Stay;
+                            }
+                        };
+                        let enabled_sources: Vec<_> =
+                            catalog::facade::list_sources(&ctx.db)
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|s| s.enabled)
+                                .collect();
+                        picker.spawn_searches(scraper, enabled_sources);
+                        return Transition::To(Box::new(picker));
+                    }
+                }
             }
             KeyCode::Tab => {
                 self.focus = if self.focus == Focus::Toc {
@@ -1935,7 +2094,10 @@ mod tests {
                 url: "".into(),
             },
         ];
-        let result = apply_fuzzy_filter("入魔", &chapters);
+        let result: Vec<usize> = apply_fuzzy_filter("入魔", &chapters, None)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         assert_eq!(result, vec![1]);
     }
 
@@ -1954,10 +2116,87 @@ mod tests {
                 url: "".into(),
             },
         ];
-        let r1 = apply_fuzzy_filter("123", &chapters);
+        let r1: Vec<usize> = apply_fuzzy_filter("123", &chapters, None)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         assert!(r1.contains(&0), "123 should match 第123章");
-        let r2 = apply_fuzzy_filter("入魔", &chapters);
-        assert!(r2.contains(&1), "入魔 should match 第50章 入魔之路");
+        let r2 = apply_fuzzy_filter("入魔", &chapters, None);
+        assert!(
+            r2.into_iter().map(|(i, _)| i).collect::<Vec<_>>().contains(&1),
+            "入魔 should match 第50章 入魔之路"
+        );
+    }
+
+    /// INT-fuzzy-anchor-01: tiebreak proximity
+    /// REQ-002 S3 — apply_fuzzy_filter anchor=Some(a) 時 secondary key
+    /// `|idx as i64 - a| asc` 拆同 score。
+    #[test]
+    fn int_fuzzy_anchor_01_tiebreak_proximity() {
+        let chapters = vec![
+            ChapterMeta { index: 0, name: "前言".into(), url: "u0".into() },
+            ChapterMeta { index: 1, name: "出關".into(), url: "u1".into() },
+            ChapterMeta { index: 2, name: "閒篇".into(), url: "u2".into() },
+            ChapterMeta { index: 3, name: "他事".into(), url: "u3".into() },
+            ChapterMeta { index: 4, name: "出關".into(), url: "u4".into() },
+        ];
+        // anchor=Some(2)、query="出關" → idx 1 vs idx 4 同 score；
+        // proximity |1-2|=1 < |4-2|=2 → idx 1 勝。
+        let result = apply_fuzzy_filter("出關", &chapters, Some(2));
+        assert_eq!(
+            result.first().map(|(i, _)| *i),
+            Some(1),
+            "anchor 2 應選 proximity 1 (idx 1) 而非 proximity 2 (idx 4)"
+        );
+    }
+
+    /// INT-fuzzy-anchor-02: anchor=None stable order
+    /// REQ-002 S6 — anchor=None 不加 secondary key、走 stable order。
+    #[test]
+    fn int_fuzzy_anchor_02_none_stable_order() {
+        let chapters = vec![
+            ChapterMeta { index: 0, name: "前言".into(), url: "u0".into() },
+            ChapterMeta { index: 1, name: "出關".into(), url: "u1".into() },
+            ChapterMeta { index: 4, name: "出關".into(), url: "u4".into() },
+        ];
+        let result = apply_fuzzy_filter("出關", &chapters, None);
+        assert_eq!(
+            result.first().map(|(i, _)| *i),
+            Some(1),
+            "anchor=None 走 stable order，命中順序第一筆 idx=1"
+        );
+    }
+
+    /// INT-fuzzy-cjk-mapping-01: 跨書源 CJK 章名 fuzzy + proximity tiebreak
+    ///
+    /// 模擬「舊源第 47 章《出關》→ 新源 toc」場景；picker fuzzy-match 章名
+    /// 共同部分「出關」（章節號不同所以不能直接 query 全章名 — SkimMatcherV2
+    /// 要求 query 每 char 順序出現於 target，含「47」會 zero-match）。
+    /// anchor=Some(1) → 第 48 章 (idx 1, proximity 0) 勝過第 100 章
+    /// (idx 3, proximity 2)。
+    #[test]
+    fn int_fuzzy_cjk_mapping_01() {
+        let new_toc = vec![
+            ChapterMeta { index: 0, name: "序章".into(), url: "u0".into() },
+            ChapterMeta { index: 1, name: "第 48 章 出關".into(), url: "u1".into() },
+            ChapterMeta { index: 2, name: "中間章".into(), url: "u2".into() },
+            ChapterMeta { index: 3, name: "第 100 章 出關".into(), url: "u3".into() },
+        ];
+        // anchor=Some(1) 模擬「舊章節在新 toc 的對位估計」；
+        // 兩 candidate 同 score → proximity tiebreak。
+        let result = apply_fuzzy_filter("出關", &new_toc, Some(1));
+        let best_idx = result.first().map(|(i, _)| *i);
+        assert_eq!(
+            best_idx,
+            Some(1),
+            "CJK 章名 fuzzy + proximity tiebreak → 第 48 章 (idx 1)"
+        );
+        // pick_best_with_anchor 應與 first() 一致。
+        assert_eq!(
+            pick_best_with_anchor(&result, Some(1)).map(|(i, _)| i),
+            Some(1),
+            "pick_best_with_anchor 與 first 一致"
+        );
     }
 
     /// INT-mode-04: Backspace 空 query no panic + filter mode 強制展開
@@ -2721,6 +2960,167 @@ mod tests {
         assert_eq!(
             reader.toc_width_cached, 0,
             "toc_collapsed=true → 0"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // TASK-tui-wire-02 — INT-entry-reader-normal-build-02 /
+    //                    INT-entry-reader-filter-no-op-03 /
+    //                    INT-entry-reader-chapter-not-found-06
+    //
+    // REQ-005 reader 's' wire 到 SearchPickerScreen (Normal mode 進 picker、
+    // Filter mode 's' append query 不開 picker、Normal mode 但 current 越界
+    // chapters → 不開 picker + 顯 toast)。
+    // -----------------------------------------------------------------------
+
+    /// INT-entry-reader-normal-build-02 — Normal mode 按 s → classify_s_press_reader
+    /// 回 OpenPicker，欄位含 novel_id / book_name / author / old_chapter_idx /
+    /// old_chapter_name / picker entry.previous_chapter_idx。
+    #[tokio::test]
+    async fn int_entry_reader_normal_build_02() {
+        // 構造 reader Normal mode：novel_id=5, current=47, chapters[47].name="出關"。
+        // mk_reader 內 novel 預設 name="n"，需要 override 為較具識別的字串。
+        let mut chapters: Vec<ChapterMeta> = (0..50)
+            .map(|i| ChapterMeta {
+                index: i as i64,
+                name: format!("第 {} 章", i + 1),
+                url: format!("u/{}", i),
+            })
+            .collect();
+        chapters[47].name = "出關".into();
+        let buf = mk_buffer(None, 47, None, None, "X", None);
+        let mut reader = mk_reader(EntryMode::Menu, chapters, 47, buf);
+        reader.novel_id = 5;
+        reader.novel.id = Some(5);
+        reader.novel.name = "天龍八部".into();
+        reader.novel.author = Some("金庸".into());
+
+        let action = classify_s_press_reader(&reader);
+        match action {
+            ReaderSAction::OpenPicker {
+                novel_id,
+                book_name,
+                author,
+                old_chapter_idx,
+                old_chapter_name,
+            } => {
+                assert_eq!(novel_id, 5);
+                assert_eq!(book_name, "天龍八部");
+                assert_eq!(author, "金庸");
+                assert_eq!(old_chapter_idx, 47);
+                assert_eq!(old_chapter_name, "出關");
+
+                // 驗 picker 構造：用 OpenPicker 欄位餵 SearchPickerScreen::new
+                // 並驗 picker 內部 fields (pub(crate) 可讀)。
+                let picker =
+                    crate::presentation::handlers::tui::picker::SearchPickerScreen::new(
+                        crate::presentation::handlers::tui::picker::PickerEntry::Reader {
+                            previous_chapter_idx: 47,
+                        },
+                        novel_id,
+                        book_name.clone(),
+                        author.clone(),
+                        old_chapter_idx,
+                        old_chapter_name.clone(),
+                    );
+                assert_eq!(picker.novel_id, 5);
+                assert_eq!(picker.book_name, "天龍八部");
+                assert_eq!(picker.author, "金庸");
+                assert_eq!(picker.old_chapter_idx, 47);
+                assert_eq!(picker.old_chapter_name, "出關");
+                assert!(matches!(
+                    picker.entry,
+                    crate::presentation::handlers::tui::picker::PickerEntry::Reader {
+                        previous_chapter_idx: 47
+                    }
+                ));
+            }
+            other => panic!("應為 OpenPicker，實際 = {:?}", other),
+        }
+    }
+
+    /// INT-entry-reader-filter-no-op-03 — Filter mode + query="入" + 按 s →
+    /// query 變 "入s"、mode 仍 Filter、Transition::Stay、picker 不開。
+    #[tokio::test]
+    async fn int_entry_reader_filter_no_op_03() {
+        let mut reader = mock_reader_min(EntryMode::Menu);
+        let mut ctx = test_ctx();
+
+        // 進 Filter、輸入「入」
+        let _ = reader
+            .handle_event(press(KeyCode::Char('/')), &mut ctx)
+            .await;
+        let _ = reader
+            .handle_event(press(KeyCode::Char('入')), &mut ctx)
+            .await;
+
+        // precondition：query == "入"
+        if let ReaderMode::Filter { query, .. } = &reader.mode {
+            assert_eq!(query, "入", "precondition: query 為 '入'");
+        } else {
+            panic!("precondition: 應在 Filter mode");
+        }
+
+        // 按 's' — 應 append 到 query，不開 picker
+        let t = reader
+            .handle_event(press(KeyCode::Char('s')), &mut ctx)
+            .await;
+
+        assert!(
+            matches!(t, Transition::Stay),
+            "Filter mode 按 's' 應 Stay，不開 picker"
+        );
+        if let ReaderMode::Filter { query, .. } = &reader.mode {
+            assert_eq!(
+                query, "入s",
+                "Filter mode 's' 須 append 到 query，不觸發 picker entry"
+            );
+        } else {
+            panic!("應仍在 Filter mode");
+        }
+    }
+
+    /// INT-entry-reader-chapter-not-found-06 — Normal mode + current=99 但
+    /// chapters.len()=50 → 按 s → 不開 picker、reader.toast = "找不到舊章節，
+    /// 無法換源"、reader.toast_expires_at = Some(.. + TOAST_TTL)。
+    #[tokio::test]
+    async fn int_entry_reader_chapter_not_found_06() {
+        let chapters: Vec<ChapterMeta> = (0..50)
+            .map(|i| ChapterMeta {
+                index: i as i64,
+                name: format!("第 {} 章", i + 1),
+                url: format!("u/{}", i),
+            })
+            .collect();
+        let buf = mk_buffer(None, 0, None, None, "X", None);
+        // current=99 越界 chapters[]（mk_reader 預設 Normal mode）
+        let mut reader = mk_reader(EntryMode::Menu, chapters, 99, buf);
+        reader.novel_id = 5;
+        reader.novel.id = Some(5);
+        let mut ctx = test_ctx();
+
+        let before = Instant::now();
+        let t = reader
+            .handle_event(press(KeyCode::Char('s')), &mut ctx)
+            .await;
+        let after = Instant::now();
+
+        assert!(
+            matches!(t, Transition::Stay),
+            "current 越界 → 應 Stay，不開 picker"
+        );
+        assert_eq!(
+            reader.toast.as_deref(),
+            Some("找不到舊章節，無法換源"),
+            "越界 chapter → 必設特定 toast 訊息"
+        );
+        let exp = reader
+            .toast_expires_at
+            .expect("toast_expires_at 必須 set");
+        // exp 應在 [before + TOAST_TTL, after + TOAST_TTL] 區間
+        assert!(
+            exp >= before + TOAST_TTL && exp <= after + TOAST_TTL,
+            "toast_expires_at 應為 now + TOAST_TTL"
         );
     }
 }

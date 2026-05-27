@@ -270,10 +270,15 @@ impl LibraryDb {
     ///   1. UPDATE novels SET source_url=?, book_url=? WHERE id=?
     ///   2. DELETE FROM chapters WHERE novel_id=?
     ///   3. INSERT INTO chapters(novel_id,idx,name,url,content=NULL) for each new chapter
-    ///   4. UPSERT progress SET chapter_index=first_idx, scroll_offset=0, updated_at=now
+    ///   4. UPSERT progress SET chapter_index=resolved_idx, scroll_offset=0, updated_at=now
     ///
     /// Any step's error propagates via `?` → `Transaction` Drop without commit = rollback.
-    /// Returns the first chapter's idx (the new `progress.chapter_index`).
+    /// Returns the written `progress.chapter_index` (= resolved_idx).
+    ///
+    /// `target_idx` (TASK-library-01): the **chapter index value** the caller wants
+    /// pinned (e.g. resolved by similarity match on the old reading position). Sanity
+    /// check is `i >= 0 && (i as usize) < new_chapters.len()`; if `Some` but OOB, or
+    /// `None`, fall back to `first_idx` (= `new_chapters.first().index`). Never panics.
     ///
     /// Defensive: empty `new_chapters` returns `Err` (caller should have aborted earlier).
     pub fn update_book_source_tx(
@@ -282,8 +287,16 @@ impl LibraryDb {
         new_src_url: &str,
         new_book_url: &str,
         new_chapters: &[ChapterMeta],
+        target_idx: Option<i64>,
     ) -> Result<i64> {
-        self.update_book_source_tx_inner(novel_id, new_src_url, new_book_url, new_chapters, None)
+        self.update_book_source_tx_inner(
+            novel_id,
+            new_src_url,
+            new_book_url,
+            new_chapters,
+            target_idx,
+            None,
+        )
     }
 
     /// Test-only: same as `update_book_source_tx` but injects an `Err` after the
@@ -303,6 +316,7 @@ impl LibraryDb {
             new_src_url,
             new_book_url,
             new_chapters,
+            None,
             Some(fault_step),
         )
     }
@@ -313,6 +327,7 @@ impl LibraryDb {
         new_src_url: &str,
         new_book_url: &str,
         new_chapters: &[ChapterMeta],
+        target_idx: Option<i64>,
         fault_step: Option<u8>,
     ) -> Result<i64> {
         if new_chapters.is_empty() {
@@ -321,6 +336,11 @@ impl LibraryDb {
             ));
         }
         let first_idx = new_chapters.first().unwrap().index;
+        // TASK-library-01: caller-supplied target_idx wins iff in-bounds (defensive
+        // upper + negative); otherwise fall back to first_idx. Never panics.
+        let resolved_idx = target_idx
+            .filter(|&i| i >= 0 && (i as usize) < new_chapters.len())
+            .unwrap_or(first_idx);
         let now = chrono::Utc::now().to_rfc3339();
 
         let tx = self.conn.transaction()?;
@@ -360,14 +380,14 @@ impl LibraryDb {
                chapter_index=excluded.chapter_index,
                scroll_offset=excluded.scroll_offset,
                updated_at=excluded.updated_at",
-            params![novel_id, first_idx, 0_i64, now],
+            params![novel_id, resolved_idx, 0_i64, now],
         )?;
         if fault_step == Some(4) {
             return Err(anyhow!("injected fault @ step 4 (UPSERT progress)"));
         }
 
         tx.commit()?;
-        Ok(first_idx)
+        Ok(resolved_idx)
     }
 }
 
@@ -555,7 +575,7 @@ mod tests {
 
         let returned = f
             .db
-            .update_book_source_tx(f.novel_id, new_src, new_book, &new_chapters)
+            .update_book_source_tx(f.novel_id, new_src, new_book, &new_chapters, None)
             .expect("happy path should succeed");
 
         // (vi) returned value is new TOC's first idx.
@@ -670,6 +690,7 @@ mod tests {
             "https://new-source.example/",
             "https://new-book.example/1",
             &new_chapters,
+            None,
         )
         .expect("update should succeed");
 
@@ -698,12 +719,71 @@ mod tests {
                 "https://new-source.example/",
                 "https://new-book.example/1",
                 &new_chapters,
+                None,
             )
             .expect("update should succeed");
 
         assert_eq!(returned, 5);
         let p = f.db.get_progress(f.novel_id).unwrap().unwrap();
         assert_eq!(p.chapter_index, 5);
+    }
+
+    // ---- INT-switch-target-*: target_idx parameter (TASK-library-01) ----
+    //
+    // setup_fixture builds an in-memory DB with 1 novel + 5 chapters; we feed
+    // a fresh new_toc (5 chapters at idx 0..5) and assert that:
+    //   * Some(valid) → progress.chapter_index = that idx
+    //   * None → fall back to first idx
+    //   * Some(out-of-bounds) (upper or negative) → fall back to first idx
+    // The fall-back path must never panic.
+
+    fn run_switch_with_target(target_idx: Option<i64>) -> (Fixture, i64) {
+        let mut f = setup_fixture();
+        let new_chapters = new_toc(0, 5); // first.idx = 0, count = 5
+        let returned = f
+            .db
+            .update_book_source_tx(
+                f.novel_id,
+                "https://new-source.example/",
+                "https://new-book.example/1",
+                &new_chapters,
+                target_idx,
+            )
+            .expect("update should succeed");
+        (f, returned)
+    }
+
+    #[test]
+    fn int_switch_target_some_01_writes_specified_idx() {
+        let (f, returned) = run_switch_with_target(Some(3));
+        assert_eq!(returned, 3, "returned value must equal target_idx");
+        let p = f.db.get_progress(f.novel_id).unwrap().unwrap();
+        assert_eq!(p.chapter_index, 3);
+        assert_eq!(p.scroll_offset, 0);
+    }
+
+    #[test]
+    fn int_switch_target_none_02_falls_back_first_idx() {
+        let (f, returned) = run_switch_with_target(None);
+        assert_eq!(returned, 0, "None falls back to first idx (0)");
+        let p = f.db.get_progress(f.novel_id).unwrap().unwrap();
+        assert_eq!(p.chapter_index, 0);
+    }
+
+    #[test]
+    fn int_switch_target_out_of_bounds_01_upper() {
+        let (f, returned) = run_switch_with_target(Some(99));
+        assert_eq!(returned, 0, "upper OOB falls back to first idx");
+        let p = f.db.get_progress(f.novel_id).unwrap().unwrap();
+        assert_eq!(p.chapter_index, 0);
+    }
+
+    #[test]
+    fn int_switch_target_out_of_bounds_02_negative() {
+        let (f, returned) = run_switch_with_target(Some(-1));
+        assert_eq!(returned, 0, "negative OOB falls back to first idx");
+        let p = f.db.get_progress(f.novel_id).unwrap().unwrap();
+        assert_eq!(p.chapter_index, 0);
     }
 
     // ---- get_novel_by_book_url ----
@@ -828,6 +908,7 @@ mod tests {
             "https://new-source.example/",
             "https://new-book.example/1",
             &[],
+            None,
         );
         assert!(res.is_err());
 
