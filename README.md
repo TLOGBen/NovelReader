@@ -8,7 +8,7 @@ Rust 寫的終端機小說閱讀器，採「資料驅動書源」+ DDD 架構。
 
 - **資料驅動書源**：四組 CSS 規則（`ruleSearch / ruleBookInfo / ruleToc / ruleContent`），
   迷你 DSL：`selector@attr##regex##replace`，`||` 串 fallback
-- **TLS 指紋偽裝**：`wreq` + BoringSSL 模擬 Chrome 131 JA3/JA4，過 Cloudflare 不 403
+- **瀏覽器相容 TLS**：`wreq` + BoringSSL 模擬主流瀏覽器的 TLS 行為，提供穩定的連線相容性
 - **SQLite 本地書架**：書 / 章節 / 進度全本地存 `$XDG_DATA_HOME/novel-looker/`
 - **ratatui TUI 閱讀器**（2026-05-27 大改寫）：
   - **Eager 3-chapter buffer** — prev/curr/next 三章拼一個 String，跨章邊界滾動視覺無斷裂
