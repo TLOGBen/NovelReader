@@ -1388,9 +1388,11 @@ fn draw(f: &mut Frame, area: Rect, app: &ReaderScreen) {
                         ListItem::new(format!("{prefix}{}", truncate(&c.name, 24)))
                     })
                     .collect();
+                // 底邊提示：讓使用者知道章節目錄可按 `/` 模糊搜尋（否則無從發現）。
                 let toc_block = Block::default()
                     .borders(Borders::ALL)
                     .title(format!(" {} ", truncate(&app.novel.name, 24)))
+                    .title_bottom(" / 搜尋章節 ")
                     .border_style(focus_style(app.focus == Focus::Toc));
                 let list = List::new(items).block(toc_block).highlight_style(
                     Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
