@@ -86,6 +86,13 @@ pub enum Cmd {
         #[arg(long)]
         source: String,
     },
+    /// 匯出已快取章節為 EPUB 電子書（缺內容的章節跳過，先 sync 取回）
+    Epub {
+        /// 書架上的 novel_id
+        novel_id: i64,
+        /// 輸出 .epub 檔案路徑
+        path: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -135,6 +142,7 @@ pub async fn run(cli: Cli, mut ctx: AppContext) -> Result<()> {
         Some(Cmd::SwitchSource { novel_id, new_book_url, source }) => {
             handlers::switch_source::handle(novel_id, new_book_url, source, &mut ctx).await
         }
+        Some(Cmd::Epub { novel_id, path }) => handlers::epub::handle(novel_id, path, &mut ctx).await,
         // 無子命令：移交 owned ctx 給 menu handler（TUI 主菜單需 owned AppContext）。
         None => handlers::menu::handle(ctx).await,
     }
@@ -188,6 +196,19 @@ mod tests {
                 assert!(yes);
             }
             other => panic!("expected Cmd::Remove, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cli_epub_parses_novel_id_and_path() {
+        let cli = Cli::try_parse_from(["novel-looker", "epub", "3", "/tmp/book.epub"])
+            .expect("clap should accept epub");
+        match cli.cmd {
+            Some(Cmd::Epub { novel_id, path }) => {
+                assert_eq!(novel_id, 3);
+                assert_eq!(path, PathBuf::from("/tmp/book.epub"));
+            }
+            other => panic!("expected Cmd::Epub, got {other:?}"),
         }
     }
 

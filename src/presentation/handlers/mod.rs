@@ -19,3 +19,4 @@ pub mod switch_source_core;
 pub mod switch_source;
 pub mod menu;
 pub mod remove;
+pub mod epub;

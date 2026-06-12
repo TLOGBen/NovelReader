@@ -266,8 +266,11 @@ pub async fn run_loop(app: App) -> Result<()> {
 /// - `Event::Key` with `kind == KeyEventKind::Press` → forward to screen.
 /// - Other `Event::Key` kinds (Release / Repeat) → ignore (`continue`).
 /// - `Event::Mouse(_)` → forward to screen (REQ-001 S2; previously dropped).
-/// - All other event types (Resize / Paste / FocusGained / FocusLost) →
-///   `continue` (run_loop does not forward; REQ-001 S2 final clause).
+/// - `Event::Resize / Paste / FocusGained / FocusLost` → forward to screen.
+///   Most screens treat these as no-ops; the reader uses Paste to extend its
+///   Filter-mode query, and Resize is absorbed by per-frame layout recompute.
+///   (Supersedes the original REQ-001 S2 "do not forward" clause — see README
+///   TODO "resize / paste / focus event 處理".)
 #[allow(dead_code)]
 pub(crate) async fn run_inner<E: EventSource, T: TerminalLike>(
     app: App,
@@ -288,18 +291,14 @@ pub(crate) async fn run_inner<E: EventSource, T: TerminalLike>(
             continue;
         }
         let event = events.read()?;
-        let forward = match &event {
-            Event::Key(key) => {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                true
+        // Forward everything to the current screen EXCEPT non-Press key events
+        // (Release / Repeat) which would double-fire bindings. Mouse / Resize /
+        // Paste / Focus are all forwarded; screens that don't care return
+        // `Transition::Stay` (their `handle_event` has a catch-all arm).
+        if let Event::Key(key) = &event {
+            if key.kind != KeyEventKind::Press {
+                continue;
             }
-            Event::Mouse(_) => true,
-            _ => false,
-        };
-        if !forward {
-            continue;
         }
 
         match current.handle_event(event, ctx).await {
@@ -473,15 +472,16 @@ mod tests {
         );
     }
 
-    /// INT-trait-05: run_inner ignores Resize / Paste / FocusGained.
+    /// INT-trait-05: run_inner now FORWARDS Resize / Paste / FocusGained to the
+    /// current screen (README TODO "resize / paste / focus event 處理" — this
+    /// supersedes the original "ignore" invariant).
     ///
     /// Queue: [Resize, Paste, FocusGained, Key('q')]
-    /// Mock screen quits on first event received. Verify the first three
-    /// events were NOT forwarded — screen only saw the Key event.
+    /// Mock screen quits after 4 events. Verify all four were forwarded in order.
     #[tokio::test]
-    async fn int_trait_05_run_loop_ignores_resize_paste_focus() {
+    async fn int_trait_05_run_loop_forwards_resize_paste_focus() {
         let received = std::rc::Rc::new(std::cell::RefCell::new(Vec::<Event>::new()));
-        let screen = Box::new(RecordingScreen::new(received.clone(), 1));
+        let screen = Box::new(RecordingScreen::new(received.clone(), 4));
         let ctx = test_ctx();
         let app = App::new(screen, EntryMode::Menu, ctx);
 
@@ -501,19 +501,13 @@ mod tests {
         let got = received.borrow();
         assert_eq!(
             got.len(),
-            1,
-            "Resize/Paste/FocusGained 不該 forward；screen 只該收到 1 個 event"
+            4,
+            "Resize/Paste/FocusGained + Key 應全部 forward；screen 收到 4 個 event"
         );
-        assert!(
-            matches!(got[0], Event::Key(_)),
-            "forwarded event 應為 Key event"
-        );
-        // 也確認三類事件確實不在 received 列表
-        for ev in got.iter() {
-            assert!(!matches!(ev, Event::Resize(_, _)), "Resize 不該 forward");
-            assert!(!matches!(ev, Event::Paste(_)), "Paste 不該 forward");
-            assert!(!matches!(ev, Event::FocusGained), "FocusGained 不該 forward");
-        }
+        assert!(matches!(got[0], Event::Resize(80, 24)), "第一筆應為 Resize");
+        assert!(matches!(got[1], Event::Paste(_)), "第二筆應為 Paste");
+        assert!(matches!(got[2], Event::FocusGained), "第三筆應為 FocusGained");
+        assert!(matches!(got[3], Event::Key(_)), "第四筆應為 Key（quit sentinel）");
     }
 
     /// Extra: Key event with kind != Press 仍然被 run_inner ignore（既有行為不退化）。

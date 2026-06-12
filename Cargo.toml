@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-# HTTP + HTML (wreq impersonates real browser TLS/JA3 to bypass Cloudflare bot checks)
+# HTTP + HTML (wreq emulates mainstream-browser TLS behavior for connection compatibility)
 wreq = "6.0.0-rc"
 wreq-util = "3.0.0-rc"
 scraper = "0.20"
@@ -35,3 +35,5 @@ regex = "1"
 dirs = "5"
 urlencoding = "2"
 toml = "0.8"
+unicode-width = "0.2.2"
+epub-builder = "0.8.3"

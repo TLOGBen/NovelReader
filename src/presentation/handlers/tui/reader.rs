@@ -144,15 +144,31 @@ pub(crate) async fn init_buffer<S: ScraperLike>(
     let prev_pos = if pos > 0 { Some(pos - 1) } else { None };
     let next_pos = if pos < last { Some(pos + 1) } else { None };
 
-    let curr = load_content_or_fetch(novel_id, chapters, pos, scraper, src, db).await?;
-    let prev = match prev_pos {
-        Some(p) => Some(load_content_or_fetch(novel_id, chapters, p, scraper, src, db).await?),
-        None => None,
-    };
-    let next = match next_pos {
-        Some(p) => Some(load_content_or_fetch(novel_id, chapters, p, scraper, src, db).await?),
-        None => None,
-    };
+    // Phase 1 — serial cache reads (`&LibraryDb`, fast, no network).
+    // `Option<Option<String>>`: outer None = no such neighbour; inner None = cache miss.
+    let curr_cached = cache_lookup(db, novel_id, chapters[pos].index);
+    let prev_cached = prev_pos.map(|p| cache_lookup(db, novel_id, chapters[p].index));
+    let next_cached = next_pos.map(|p| cache_lookup(db, novel_id, chapters[p].index));
+
+    // Phase 2 — concurrent network fetch for the cache misses (borrows only
+    // scraper / src / chapters; **no** `db` borrow, so the three futures may
+    // run concurrently under `tokio::join!`). init bubbles Err on any failure.
+    let (curr_r, prev_r, next_r) = tokio::join!(
+        fetch_slot(&curr_cached, scraper, src, &chapters[pos].url),
+        fetch_neighbour(prev_pos, &prev_cached, scraper, src, chapters),
+        fetch_neighbour(next_pos, &next_cached, scraper, src, chapters),
+    );
+    let curr = curr_r?;
+    let prev = prev_r?;
+    let next = next_r?;
+
+    // Phase 3 — serial save-back of freshly fetched misses (`&mut LibraryDb`,
+    // best-effort; a write failure must not fail the buffer step).
+    if curr_cached.is_none() {
+        let _ = library::facade::save_chapter_content(db, novel_id, chapters[pos].index, &curr);
+    }
+    save_neighbour_back(db, novel_id, prev_pos, &prev_cached, &prev, chapters);
+    save_neighbour_back(db, novel_id, next_pos, &next_cached, &next, chapters);
 
     Ok(assemble_buffer(
         chapters,
@@ -186,29 +202,41 @@ pub(crate) async fn rebuild_buffer<S: ScraperLike>(
     let prev_pos = if pos > 0 { Some(pos - 1) } else { None };
     let next_pos = if pos < last { Some(pos + 1) } else { None };
 
-    // curr fetch fail = fatal for this rebuild
-    let curr = match load_content_or_fetch(novel_id, chapters, pos, scraper, src, db).await {
+    // Phase 1 — serial cache reads (no network).
+    let curr_cached = cache_lookup(db, novel_id, chapters[pos].index);
+    let prev_cached = prev_pos.map(|p| cache_lookup(db, novel_id, chapters[p].index));
+    let next_cached = next_pos.map(|p| cache_lookup(db, novel_id, chapters[p].index));
+
+    // Phase 2 — concurrent network fetch for the misses.
+    let (curr_r, prev_r, next_r) = tokio::join!(
+        fetch_slot(&curr_cached, scraper, src, &chapters[pos].url),
+        fetch_neighbour(prev_pos, &prev_cached, scraper, src, chapters),
+        fetch_neighbour(next_pos, &next_cached, scraper, src, chapters),
+    );
+
+    // curr fetch fail = fatal for this rebuild.
+    let curr = match curr_r {
         Ok(s) => s,
         Err(source) => return Err(RebuildError::CurrFailed { idx: curr_idx, source }),
     };
+    // prev / next fetch fail = silent degrade (drop the neighbour).
+    let (prev_ok, prev_pos_final) = match (prev_pos, prev_r) {
+        (None, _) => (None, None),
+        (Some(_), Ok(v)) => (v, prev_pos),
+        (Some(_), Err(_)) => (None, None),
+    };
+    let (next_ok, next_pos_final) = match (next_pos, next_r) {
+        (None, _) => (None, None),
+        (Some(_), Ok(v)) => (v, next_pos),
+        (Some(_), Err(_)) => (None, None),
+    };
 
-    // prev / next fetch fail = silent degrade
-    let mut prev_ok: Option<String> = None;
-    let mut prev_pos_final = prev_pos;
-    if let Some(p) = prev_pos {
-        match load_content_or_fetch(novel_id, chapters, p, scraper, src, db).await {
-            Ok(s) => prev_ok = Some(s),
-            Err(_) => prev_pos_final = None,
-        }
+    // Phase 3 — serial save-back of successful misses.
+    if curr_cached.is_none() {
+        let _ = library::facade::save_chapter_content(db, novel_id, chapters[pos].index, &curr);
     }
-    let mut next_ok: Option<String> = None;
-    let mut next_pos_final = next_pos;
-    if let Some(p) = next_pos {
-        match load_content_or_fetch(novel_id, chapters, p, scraper, src, db).await {
-            Ok(s) => next_ok = Some(s),
-            Err(_) => next_pos_final = None,
-        }
-    }
+    save_neighbour_back(db, novel_id, prev_pos_final, &prev_cached, &prev_ok, chapters);
+    save_neighbour_back(db, novel_id, next_pos_final, &next_cached, &next_ok, chapters);
 
     let degraded =
         prev_pos.is_some() && prev_pos_final.is_none()
@@ -231,24 +259,61 @@ pub(crate) async fn rebuild_buffer<S: ScraperLike>(
     }
 }
 
-/// Cache hit → return DB content; cache miss → fetch via `ScraperLike`,
-/// write back via `library::facade::save_chapter_content`, return text.
-async fn load_content_or_fetch<S: ScraperLike>(
-    novel_id: i64,
-    chapters: &[ChapterMeta],
-    pos: usize,
+/// Cache read only (`&LibraryDb`). `Some(content)` on hit, `None` on miss.
+fn cache_lookup(db: &LibraryDb, novel_id: i64, idx: i64) -> Option<String> {
+    library::facade::get_chapter(db, novel_id, idx)
+        .ok()
+        .flatten()
+        .map(|ch| ch.content)
+}
+
+/// Resolve one slot: cache hit → clone; cache miss → network fetch.
+/// Network-only (no `db`), so it is safe to drive concurrently.
+async fn fetch_slot<S: ScraperLike>(
+    cached: &Option<String>,
     scraper: &S,
     src: &BookSource,
-    db: &mut LibraryDb,
+    url: &str,
 ) -> Result<String> {
-    let meta = &chapters[pos];
-    if let Ok(Some(ch)) = library::facade::get_chapter(db, novel_id, meta.index) {
-        return Ok(ch.content);
+    match cached {
+        Some(c) => Ok(c.clone()),
+        None => scraper.fetch_chapter_content(src, url).await,
     }
-    let text = scraper.fetch_chapter_content(src, &meta.url).await?;
-    // Best-effort cache write; failure here shouldn't make the buffer step Err.
-    let _ = library::facade::save_chapter_content(db, novel_id, meta.index, &text);
-    Ok(text)
+}
+
+/// Resolve an optional neighbour (prev / next). `pos` None → `Ok(None)`.
+/// Cache hit → `Ok(Some(..))`; miss → network fetch wrapped in `Some`.
+async fn fetch_neighbour<S: ScraperLike>(
+    pos: Option<usize>,
+    cached: &Option<Option<String>>,
+    scraper: &S,
+    src: &BookSource,
+    chapters: &[ChapterMeta],
+) -> Result<Option<String>> {
+    match (pos, cached) {
+        (Some(_), Some(Some(c))) => Ok(Some(c.clone())),
+        (Some(p), _) => scraper
+            .fetch_chapter_content(src, &chapters[p].url)
+            .await
+            .map(Some),
+        (None, _) => Ok(None),
+    }
+}
+
+/// Best-effort cache write-back for a neighbour that was a cache miss and
+/// fetched successfully. No-op when the neighbour was absent, a cache hit,
+/// or the fetch produced nothing.
+fn save_neighbour_back(
+    db: &mut LibraryDb,
+    novel_id: i64,
+    pos: Option<usize>,
+    cached: &Option<Option<String>>,
+    fetched: &Option<String>,
+    chapters: &[ChapterMeta],
+) {
+    if let (Some(p), Some(None), Some(text)) = (pos, cached, fetched) {
+        let _ = library::facade::save_chapter_content(db, novel_id, chapters[p].index, text);
+    }
 }
 
 /// Pure assembly: stitches up to 3 sections, computes row offsets, applies
@@ -1018,6 +1083,37 @@ impl ReaderScreen {
         }
     }
 
+    /// Filter mode 收到 Paste：整串 append 到 query（換行 / 回車視為空格，
+    /// 避免多行貼上把 query 弄壞）、重算 fuzzy filter、selected 歸零。
+    /// 與 `handle_filter_key` 的 `Char(c)` append 同語意，只是一次接一整串。
+    fn apply_filter_paste(&mut self, text: &str) {
+        let sanitized: String = text
+            .chars()
+            .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+            .collect();
+        let new_query = if let ReaderMode::Filter { query, .. } = &self.mode {
+            let mut q = query.clone();
+            q.push_str(&sanitized);
+            q
+        } else {
+            return;
+        };
+        let new_filter: Vec<usize> = apply_fuzzy_filter(&new_query, &self.chapters, None)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        if let ReaderMode::Filter {
+            query,
+            filtered_indices,
+            selected,
+        } = &mut self.mode
+        {
+            *query = new_query;
+            *filtered_indices = new_filter;
+            *selected = 0;
+        }
+    }
+
     /// 依 entry_mode 決定退出語意（給 m / q 共用）。
     fn exit_transition(&self) -> Transition {
         match self.entry_mode {
@@ -1054,6 +1150,17 @@ impl Screen for ReaderScreen {
                 self.apply_mouse_wheel(me, ctx).await;
                 return Transition::Stay;
             }
+            // Bracketed-paste: in Filter mode the pasted text extends the query
+            // (so you can paste a chapter keyword). Normal mode ignores it.
+            Event::Paste(text) => {
+                if matches!(self.mode, ReaderMode::Filter { .. }) {
+                    self.apply_filter_paste(&text);
+                }
+                return Transition::Stay;
+            }
+            // Resize / FocusGained / FocusLost: no per-screen state to update —
+            // `draw` recomputes layout (content_area_h / toc_width_cached) from
+            // `frame.area()` every frame, so a redraw is all that's needed.
             _ => return Transition::Stay,
         };
 
@@ -1339,13 +1446,29 @@ fn focus_style(active: bool) -> Style {
     }
 }
 
+/// Truncate `s` to at most `max` **display columns** (not chars), appending
+/// '…' when cut. CJK / full-width chars count as 2 columns so mixed CJK/ASCII
+/// TOC rows and titles align to the pane width instead of overflowing.
 fn truncate(s: &str, max: usize) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() <= max {
-        s.to_string()
-    } else {
-        chars[..max].iter().collect::<String>() + "…"
+    use unicode_width::UnicodeWidthChar;
+    let total: usize = s.chars().map(|c| c.width().unwrap_or(0)).sum();
+    if total <= max {
+        return s.to_string();
     }
+    // Reserve 1 column for the ellipsis so the result still fits `max`.
+    let budget = max.saturating_sub(1);
+    let mut out = String::new();
+    let mut w = 0usize;
+    for c in s.chars() {
+        let cw = c.width().unwrap_or(0);
+        if w + cw > budget {
+            break;
+        }
+        out.push(c);
+        w += cw;
+    }
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -1735,6 +1858,104 @@ mod tests {
         match err {
             RebuildError::CurrFailed { idx, .. } => assert_eq!(idx, 1),
             other => panic!("expected CurrFailed, got {other:?}"),
+        }
+    }
+
+    /// Concurrent-fetch regression: prev-side degrade (mirror of -05 which only
+    /// covers the next side). prev=0 cache-miss + fetch Err, curr/next cached.
+    /// Must flag PartialDegraded with prev dropped, next intact.
+    #[tokio::test]
+    async fn int_buffer_07_rebuild_prev_fail_degrades() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let novel_id =
+            seed_novel_with_chapters(&mut db, &[None, Some("B"), Some("C")]);
+        let chapters = library::facade::list_chapters(&db, novel_id).unwrap();
+        let scraper = MockScraper::new().with(&url_of(0), Err(anyhow!("prev down")));
+        let src = mock_book_source();
+
+        let err = rebuild_buffer(1, novel_id, &chapters, &scraper, &src, &mut db)
+            .await
+            .expect_err("rebuild expected to flag partial degraded");
+
+        match err {
+            RebuildError::PartialDegraded(buf) => {
+                assert_eq!(buf.prev_chapter_idx, None, "prev 應因 fetch 失敗被丟棄");
+                assert_eq!(buf.curr_chapter_idx, 1);
+                assert_eq!(buf.next_chapter_idx, Some(2));
+                assert!(buf.combined_text.contains('B'));
+                assert!(buf.combined_text.contains('C'));
+            }
+            other => panic!("expected PartialDegraded, got {other:?}"),
+        }
+    }
+
+    /// Concurrent-fetch regression: both prev+next cache-miss, all three fetched
+    /// concurrently and saved back. Order of mock calls is non-deterministic, so
+    /// assert on final saved content (order-independent), not call order.
+    #[tokio::test]
+    async fn int_buffer_08_init_all_miss_concurrent_saveback() {
+        let mut db = LibraryDb::open_in_memory().unwrap();
+        let novel_id = seed_novel_with_chapters(&mut db, &[None, None, None]);
+        let chapters = library::facade::list_chapters(&db, novel_id).unwrap();
+        let scraper = MockScraper::new()
+            .with(&url_of(0), Ok("A".into()))
+            .with(&url_of(1), Ok("B".into()))
+            .with(&url_of(2), Ok("C".into()));
+        let src = mock_book_source();
+
+        let buf = init_buffer(1, novel_id, &chapters, &scraper, &src, &mut db)
+            .await
+            .expect("init all-miss concurrent");
+
+        assert_eq!(scraper.call_count(), 3, "三章 cache-miss 各抓一次");
+        assert!(buf.combined_text.contains('A'));
+        assert!(buf.combined_text.contains('B'));
+        assert!(buf.combined_text.contains('C'));
+        for (i, want) in [(0, "A"), (1, "B"), (2, "C")] {
+            let ch = library::facade::get_chapter(&db, novel_id, i).unwrap().unwrap();
+            assert_eq!(ch.content, want, "idx {i} 應 save-back");
+        }
+    }
+
+    /// CJK 字寬：truncate 以「顯示欄寬」計，全形字算 2 欄。
+    #[test]
+    fn unit_truncate_cjk_display_width() {
+        // 寬度足夠 → 原樣返回。
+        assert_eq!(truncate("你好world", 100), "你好world");
+        // 全形：6 欄預算（保留 1 給 …）→ 你(2)好(2) 後第三字超界。
+        assert_eq!(truncate("你好世界你好", 6), "你好…");
+        // ASCII：4 欄 → "abc" + …。
+        assert_eq!(truncate("abcdef", 4), "abc…");
+        // 邊界：剛好等於寬度不截斷（"中" 寬 2 == max 2）。
+        assert_eq!(truncate("中", 2), "中");
+    }
+
+    /// Paste 進 Filter mode：整串 append 到 query、換行轉空格、重算 filter。
+    #[tokio::test]
+    async fn unit_paste_in_filter_appends_query() {
+        let chapters = vec![
+            ChapterMeta { index: 0, name: "第一章 開始".into(), url: "u0".into() },
+            ChapterMeta { index: 1, name: "第二章 旅途".into(), url: "u1".into() },
+        ];
+        let buf = mk_buffer(None, 0, None, None, "X", None);
+        let mut reader = mk_reader(EntryMode::Menu, chapters, 0, buf);
+        reader.mode = ReaderMode::Filter {
+            query: String::new(),
+            filtered_indices: (0..reader.chapters.len()).collect(),
+            selected: 0,
+        };
+
+        reader.apply_filter_paste("第二");
+        match &reader.mode {
+            ReaderMode::Filter { query, .. } => assert_eq!(query, "第二"),
+            _ => panic!("應仍在 Filter mode"),
+        }
+
+        // 換行 / 回車 → 空格。
+        reader.apply_filter_paste("a\nb\rc");
+        match &reader.mode {
+            ReaderMode::Filter { query, .. } => assert_eq!(query, "第二a b c"),
+            _ => panic!("應仍在 Filter mode"),
         }
     }
 

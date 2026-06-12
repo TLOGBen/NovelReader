@@ -17,6 +17,7 @@ Rust 寫的終端機小說閱讀器，採「資料驅動書源」+ DDD 架構。
   - **滑鼠支援** — 滾輪 pane-aware（TOC = 跳章、Content = ±3 行）、左鍵點 TOC 跳章
 - **書架刪除** — TUI 內 `d` 鍵 modal 確認、CLI `remove <id>`（含 `--yes` skip）
 - **WebDAV / local 備份** — 匯出 / 匯入快照（不含章節內容、re-sync 即可）
+- **EPUB 匯出** — `epub <id> <path>` 把已快取章節打包成電子書（缺內容的章節跳過）
 
 ## 安裝
 
@@ -60,6 +61,10 @@ novel-looker import ~/snapshot.json
 # 刪書
 novel-looker remove 5             # 互動確認
 novel-looker remove 5 --yes       # 直接刪
+
+# 匯出 EPUB（只打包已快取章節；缺內容的章節跳過）
+# 註：sync 會先清掉舊快取再重抓，建議等 sync 完成後再匯出才完整
+novel-looker epub 1 ~/books/誅仙.epub
 ```
 
 ## TUI Reader 鍵盤 / 滑鼠
@@ -173,11 +178,19 @@ claude plugin validate .
 
 ## TODO
 
-- [ ] 並行 fetch（reader Eager buffer prev+next）— 目前序列 fetch，cache hit < 10ms 可接受
-- [ ] resize / paste / focus event 處理（trait 已收 `Event`，行為待補）
-- [ ] 換源（switch source 從現有書找同名書、模糊 match 章節保進度）
-- [ ] EPUB 匯出
-- [ ] CJK 字寬正確化（目前 ratatui 對混排中英可能對齊抖）
+最近完成（保留作 changelog）：
+
+- [x] 並行 fetch — reader buffer 改「序列查快取 → 並行 network → 序列存回」，cache-miss 三章並行抓
+- [x] resize / paste / focus event — run_inner 改為全 forward；reader Filter mode 支援貼上搜尋字串
+- [x] 換源（switch source，跨書源並行 streaming + fuzzy 章節對應 + atomic switch）
+- [x] EPUB 匯出（`epub <id> <path>`）
+- [x] CJK 字寬正確化 — TOC / 標題 truncate 改用 `unicode-width` 以顯示欄寬計
+
+待辦：
+
+- [ ] EPUB 封面圖嵌入（`cover_url` 下載 → `add_cover_image`，目前只含內文）
+- [ ] EPUB 匯出前可選 auto-sync 缺漏章節（目前缺內容章節直接跳過）
+- [ ] rule DSL `&`（self-selector）在 `extract_within` 仍 broken（見 `src/catalog/service/rule.rs`）
 
 ## License
 
